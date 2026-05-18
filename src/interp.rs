@@ -40,6 +40,15 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
             }
         }
 
+        Ty::Tuple { fields } => {
+            let Json::Array(items) = val else {
+                panic!("expected JSON array for tuple, got {val:?}");
+            };
+            for (f, it) in fields.iter().zip(items) {
+                unsafe { run(dst.add(f.offset), &f.ty, it) };
+            }
+        }
+
         Ty::Str(seq) => {
             let bytes = val.as_str().as_bytes();
             let p = alloc_copy(bytes, 1);

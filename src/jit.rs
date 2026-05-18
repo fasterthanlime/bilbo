@@ -566,6 +566,7 @@ impl Emit<'_, '_> {
             Ty::Struct { fields, .. } => {
                 self.parse_struct(fields, dst, cur, p)
             }
+            Ty::Tuple { fields } => self.parse_tuple(fields, dst, cur, p),
             Ty::Vec {
                 elem,
                 elem_size,
@@ -741,6 +742,32 @@ impl Emit<'_, '_> {
 
         self.b.switch_to_block(cont);
         self.b.block_params(cont)[0]
+    }
+
+    /// A tuple is a positional JSON array `[a, b, …]` with a known, fixed
+    /// arity — so we unroll it (no loop): `[`, then each field parsed at
+    /// its constant offset, comma-separated, `]`.
+    fn parse_tuple(
+        &mut self,
+        fields: &[crate::plan::FieldTy],
+        dst: Value,
+        cur: Value,
+        p: &Pctx,
+    ) -> Value {
+        let cur = self.ws(cur, p);
+        let mut c = self.b.ins().iadd_imm(cur, 1); // past '['
+        for f in fields {
+            let off = self.iconst(f.offset as i64);
+            let fdst = self.b.ins().iadd(dst, off);
+            c = self.parse(&f.ty, fdst, c, p);
+            c = self.ws(c, p);
+            let bc = self.load_u8(c);
+            let is_comma = self.byte_eq(bc, b',');
+            let c1 = self.b.ins().iadd_imm(c, 1);
+            c = self.b.ins().select(is_comma, c1, c); // optional ','
+        }
+        let c = self.ws(c, p);
+        self.b.ins().iadd_imm(c, 1) // past ']'
     }
 
     fn parse_struct(

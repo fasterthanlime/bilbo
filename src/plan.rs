@@ -15,6 +15,12 @@ pub enum Ty {
         name: String,
         fields: Vec<FieldTy>,
     },
+    /// A tuple / tuple-struct (members `__0`, `__1`, …): in JSON it's a
+    /// *positional array* `[a, b]`, not an object. `fields` are in index
+    /// order, each carrying its byte offset.
+    Tuple {
+        fields: Vec<FieldTy>,
+    },
     /// `alloc::string::String` — UTF-8 bytes behind a `Vec<u8>`.
     Str(SeqLayout),
     /// `alloc::vec::Vec<T>`.

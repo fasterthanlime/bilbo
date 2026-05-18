@@ -549,6 +549,21 @@ fn structure(dwarf: &Dwarf, unit: &Unit, off: Off, name: &str) -> Ty {
             ty: fty,
         });
     }
+    // A tuple / tuple-struct: members are `__0`, `__1`, … In JSON these
+    // are positional arrays, not objects.
+    if !fields.is_empty()
+        && fields.iter().all(|f| {
+            f.name.strip_prefix("__").is_some_and(|n| {
+                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+    {
+        let mut fields = fields;
+        fields.sort_by_key(|f| {
+            f.name[2..].parse::<u32>().unwrap_or(u32::MAX)
+        });
+        return Ty::Tuple { fields };
+    }
     Ty::Struct {
         name: name.to_string(),
         fields,
