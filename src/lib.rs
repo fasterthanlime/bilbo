@@ -33,8 +33,11 @@ pub fn debug_init() {
 /// *caller's* frame. Call this once per site; reuse the returned `Ty`.
 ///
 /// `#[inline(never)]` so the caller is exactly one frame up.
+/// # Safety
+/// `ptr` must point to the local you intend to fill; the returned `Ty`
+/// describes that local's type.
 #[inline(never)]
-pub fn resolve(ptr: *mut u8) -> Arc<Ty> {
+pub unsafe fn resolve(ptr: *mut u8) -> Arc<Ty> {
     let caller = frame::caller();
     resolve::plan_for(&caller, ptr as u64)
 }
@@ -43,8 +46,12 @@ pub fn resolve(ptr: *mut u8) -> Arc<Ty> {
 /// parse the JSON, and bind it with the interpreter.
 ///
 /// `#[inline(never)]` so the frame walk sees the real caller.
+///
+/// # Safety
+/// `ptr` must point to uninitialized storage of exactly the type of the
+/// local it aliases in the caller's frame.
 #[inline(never)]
-pub fn from_json(s: &str, ptr: *mut u8) {
+pub unsafe fn from_json(s: &str, ptr: *mut u8) {
     let caller = frame::caller();
     let ty = resolve::plan_for(&caller, ptr as u64);
     let value = json::parse(s);

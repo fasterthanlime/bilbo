@@ -18,16 +18,19 @@ fn main() {
     }
 
     let mut e: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
-    dwarf_json::from_json(
-        r#"
-        {
-          "host": "rustweek.org",
-          "port": 443,
-          "tags": ["conf", "rust", "🦀"],
-        }
-    "#,
-        &mut e as *mut _ as *mut u8,
-    );
+    // Safety: `e` is exactly the local `ptr` will be matched to.
+    unsafe {
+        dwarf_json::from_json(
+            r#"
+            {
+              "host": "rustweek.org",
+              "port": 443,
+              "tags": ["conf", "rust", "🦀"],
+            }
+        "#,
+            &mut e as *mut _ as *mut u8,
+        );
+    }
     // Safety: yolo
     let e = unsafe { e.assume_init() };
     info!(

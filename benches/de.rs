@@ -3,7 +3,9 @@
 
 use std::mem::MaybeUninit;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use facet::Facet;
 use serde::Deserialize;
 
@@ -38,11 +40,13 @@ fn bench(c: &mut Criterion) {
     g.bench_function("dwarf_json_interp", |b| {
         b.iter(|| {
             let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
-            dwarf_json::from_json(
-                black_box(JSON),
-                &mut e as *mut _ as *mut u8,
-            );
-            black_box(unsafe { e.assume_init() });
+            unsafe {
+                dwarf_json::from_json(
+                    black_box(JSON),
+                    &mut e as *mut _ as *mut u8,
+                );
+                black_box(e.assume_init());
+            }
         })
     });
 
