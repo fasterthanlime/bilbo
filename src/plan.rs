@@ -37,18 +37,25 @@ pub enum Ty {
     },
     /// A zero-sized field (`()`): consume the JSON value, write nothing.
     Unit,
-    /// A niche-optimized `Option<T>` (e.g. `Option<String>`): no tag byte,
-    /// `None` is a sentinel value in a field that a valid `T` never has.
-    NicheOption {
-        /// Offset of the discriminant field within the option.
+    /// An `Option<T>` (one data variant + one empty variant), covering
+    /// both encodings DWARF emits:
+    ///
+    /// * **niche** (`Option<String>`): no separate tag — the discriminant
+    ///   field overlaps the payload, `Some` has no `discr_value`, payload
+    ///   sits at offset 0. `some_discr` is `None` (writing a valid `T`
+    ///   already encodes `Some`).
+    /// * **tagged** (`Option<u64>`): a real tag at `disc_off`, payload at
+    ///   `payload_off`. `some_discr` is `Some(tag)`.
+    Opt {
         disc_off: usize,
-        /// Its size in bytes.
         disc_size: u8,
-        /// The value the discriminant holds for `None`.
-        none_val: u128,
-        /// Total size of the option (== size of `T`); zeroed for `None`.
+        none_discr: u128,
+        /// `Some`'s tag value, or `None` for the niche encoding.
+        some_discr: Option<u128>,
+        /// Offset of `Some`'s payload within the option.
+        payload_off: usize,
+        /// Total size of the option (zeroed before writing `None`).
         size: u64,
-        /// `Some`'s payload, laid out in place.
         inner: Box<Ty>,
     },
     /// `BTreeMap<String, V>`. Built by calling the real std map via the

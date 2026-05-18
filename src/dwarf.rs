@@ -527,7 +527,7 @@ fn structure(dwarf: &Dwarf, unit: &Unit, off: Off, name: &str) -> Ty {
     }
     // Niche-optimized enum (e.g. `Option<String>`): a `variant_part`.
     if let Some(vp) = child_with_tag(unit, off, gimli::DW_TAG_variant_part) {
-        return niche_option(dwarf, unit, off, vp, name);
+        return parse_option(dwarf, unit, off, vp, name);
     }
 
     // A plain aggregate: recurse into its members.
@@ -663,11 +663,11 @@ fn resolve_tramp(
     None
 }
 
-/// Parse a niche-optimized two-variant enum (`Option<T>`): one variant has
-/// a `DW_AT_discr_value` and an empty payload (`None`), the other has no
-/// discr value and a `__0: T` payload (`Some`). The discriminant overlaps
-/// the payload (no tag byte).
-fn niche_option(
+/// Parse a two-variant `Option<T>` from a `variant_part`, handling both
+/// the niche encoding (Some has no `discr_value`, payload at offset 0,
+/// discriminant overlaps it) and the tagged encoding (separate tag, Some
+/// has a `discr_value`, payload after the tag).
+fn parse_option(
     dwarf: &Dwarf,
     unit: &Unit,
     off: Off,
@@ -692,8 +692,8 @@ fn niche_option(
         .and_then(|t| udata(unit, t, gimli::DW_AT_byte_size))
         .unwrap_or(8) as u8;
 
-    let mut none_val: Option<u128> = None;
-    let mut inner: Option<Ty> = None;
+    let mut none_discr: Option<u128> = None;
+    let mut some: Option<(Option<u128>, usize, Ty)> = None; // (discr, off, T)
     for v in child_offsets(unit, Some(vp)) {
         if tag(unit, v) != gimli::DW_TAG_variant {
             continue;
@@ -702,31 +702,43 @@ fn niche_option(
         let Some(pm) = child_with_tag(unit, v, gimli::DW_TAG_member) else {
             continue;
         };
+        let pm_off =
+            udata(unit, pm, gimli::DW_AT_data_member_location).unwrap_or(0)
+                as usize;
         let Some(pstruct) = type_ref(unit, pm) else { continue };
         let pstruct = strip(unit, pstruct);
-        // payload field `__0`, if any
         let f0 = child_offsets(unit, Some(pstruct)).into_iter().find(|&c| {
             tag(unit, c) == gimli::DW_TAG_member
                 && die_name(dwarf, unit, c).as_deref() == Some("__0")
         });
-        match (dv, f0) {
-            (Some(val), None) => none_val = Some(val as u128),
-            (_, Some(f0)) => {
+        match f0 {
+            None => none_discr = dv.map(|x| x as u128),
+            Some(f0) => {
+                let foff =
+                    udata(unit, f0, gimli::DW_AT_data_member_location)
+                        .unwrap_or(0) as usize;
                 if let Some(t) = type_ref(unit, f0) {
-                    inner = Some(classify(dwarf, unit, t));
+                    some = Some((
+                        dv.map(|x| x as u128),
+                        pm_off + foff,
+                        classify(dwarf, unit, t),
+                    ));
                 }
             }
-            _ => {}
         }
     }
-    match (none_val, inner) {
-        (Some(none_val), Some(inner)) => Ty::NicheOption {
-            disc_off,
-            disc_size,
-            none_val,
-            size,
-            inner: Box::new(inner),
-        },
+    match (none_discr, some) {
+        (Some(none_discr), Some((some_discr, payload_off, inner))) => {
+            Ty::Opt {
+                disc_off,
+                disc_size,
+                none_discr,
+                some_discr,
+                payload_off,
+                size,
+                inner: Box::new(inner),
+            }
+        }
         _ => unk(),
     }
 }

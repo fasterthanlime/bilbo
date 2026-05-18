@@ -53,6 +53,33 @@ fn main() {
         k.host, k.port, k.tags
     );
 
+    // Tagged Option<scalar> round-trip (the new A1 capability).
+    #[derive(Debug, PartialEq)]
+    struct Opt {
+        a: Option<u64>,
+        b: Option<i32>,
+        c: Option<bool>,
+        n: Option<u64>,
+        s: Option<String>,
+    }
+    let mut o: std::mem::MaybeUninit<Opt> = std::mem::MaybeUninit::uninit();
+    unsafe {
+        dwarf_json::from_json_jit_parse(
+            r#"{"a":42,"b":-7,"c":true,"n":null,"s":null}"#,
+            &mut o as *mut _ as *mut u8,
+        );
+    }
+    let o = unsafe { o.assume_init() };
+    let want = Opt {
+        a: Some(42),
+        b: Some(-7),
+        c: Some(true),
+        n: None,
+        s: None,
+    };
+    assert_eq!(o, want, "tagged Option<scalar> round-trip");
+    info!("🎉 opt:    {o:?}  (tagged Option OK)");
+
     // Profiling mode: print the JIT'd parser's code address and hammer it
     // forever so `stax` can sample + disassemble it.
     //   DWARF_JSON_PROFILE=1 cargo run --release

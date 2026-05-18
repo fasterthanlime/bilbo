@@ -96,21 +96,30 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
         Ty::Unit => { /* zero-sized: consume the JSON value, write nothing */
         }
 
-        Ty::NicheOption {
+        Ty::Opt {
             disc_off,
             disc_size,
-            none_val,
+            none_discr,
+            some_discr,
+            payload_off,
             size,
             inner,
         } => {
+            let ds = *disc_size as usize;
             if matches!(val, Json::Null) {
                 unsafe { std::ptr::write_bytes(dst, 0, *size as usize) };
-                let nb = none_val.to_le_bytes();
+                let nb = none_discr.to_le_bytes();
                 unsafe {
-                    write_bytes(dst.add(*disc_off), &nb[..*disc_size as usize])
+                    write_bytes(dst.add(*disc_off), &nb[..ds])
                 };
             } else {
-                unsafe { run(dst, inner, val) };
+                unsafe { run(dst.add(*payload_off), inner, val) };
+                if let Some(sd) = some_discr {
+                    let sb = sd.to_le_bytes();
+                    unsafe {
+                        write_bytes(dst.add(*disc_off), &sb[..ds])
+                    };
+                }
             }
         }
 

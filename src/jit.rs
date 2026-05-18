@@ -515,8 +515,9 @@ impl Emit<'_, '_> {
                 let b = self.load_u8(c);
                 let is_t = self.byte_eq(b, b't');
                 let is_f = self.byte_eq(b, b'f');
-                let v = self.b.ins().ireduce(types::I8, is_t);
-                self.b.ins().store(MemFlags::trusted(), v, dst, 0);
+                // `icmp` already yields an i8 0/1 — store it directly
+                // (an `ireduce` here would be i8->i8, which is invalid).
+                self.b.ins().store(MemFlags::trusted(), is_t, dst, 0);
                 // "true"=4, "false"=5, "null"=4
                 let five = self.iconst(5);
                 let four = self.iconst(4);
@@ -577,10 +578,12 @@ impl Emit<'_, '_> {
             // Zero-sized (`()`): skip the JSON value, write nothing.
             Ty::Unit => self.call2(self.shims.skip, cur, p.end),
 
-            Ty::NicheOption {
+            Ty::Opt {
                 disc_off,
                 disc_size,
-                none_val,
+                none_discr,
+                some_discr,
+                payload_off,
                 size,
                 inner,
             } => {
@@ -595,12 +598,17 @@ impl Emit<'_, '_> {
 
                 self.b.switch_to_block(none_b);
                 self.memset0(dst, *size);
-                self.store_imm(dst, *disc_off as i64, *none_val, *disc_size);
+                self.store_imm(dst, *disc_off as i64, *none_discr, *disc_size);
                 let c4 = self.b.ins().iadd_imm(c, 4); // past "null"
                 self.b.ins().jump(cont, &[c4.into()]);
 
                 self.b.switch_to_block(some_b);
-                let cc = self.parse(inner, dst, c, p);
+                let off = self.iconst(*payload_off as i64);
+                let pdst = self.b.ins().iadd(dst, off);
+                let cc = self.parse(inner, pdst, c, p);
+                if let Some(sd) = some_discr {
+                    self.store_imm(dst, *disc_off as i64, *sd, *disc_size);
+                }
                 self.b.ins().jump(cont, &[cc.into()]);
 
                 self.b.switch_to_block(cont);
