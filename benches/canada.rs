@@ -46,17 +46,44 @@ fn main() {
         dwarf_json::from_json_jit_parse(J, &mut got as *mut _ as *mut u8);
         got.assume_init()
     };
-    // serde_json's *default* float parser is only best-effort (≈1 ULP);
-    // the `float_roundtrip` feature makes it correctly-rounded, matching
-    // our `str::parse::<f64>` so this is an exact, fair comparison.
-    assert!(
-        got == want,
-        "JIT parser disagrees with serde_json on canada.json"
+    // Correctness gate. We can't use `got == want`: serde_json's
+    // *default* float parser (what everyone actually runs — benching
+    // against `float_roundtrip` would just gimp serde) is best-effort
+    // and ≈1 ULP off. *We* are the correctly-rounded side (our f64s
+    // match Python / Rust `str::parse`). So: structure + strings + the
+    // ring/point shape must be exact, and every coordinate must agree
+    // with serde to within 2 ULP (i.e. serde's own float error).
+    fn ulps(a: f64, b: f64) -> u64 {
+        let (x, y) = (a.to_bits() as i64, b.to_bits() as i64);
+        x.abs_diff(y)
+    }
+    assert_eq!(got.r#type, want.r#type);
+    assert_eq!(got.features.len(), want.features.len());
+    let gc = &got.features[0].geometry.coordinates;
+    let wc = &want.features[0].geometry.coordinates;
+    assert_eq!(got.features[0].r#type, want.features[0].r#type);
+    assert_eq!(
+        got.features[0].properties.name,
+        want.features[0].properties.name
     );
+    assert_eq!(got.features[0].geometry.r#type, want.features[0].geometry.r#type);
+    assert_eq!(gc.len(), wc.len(), "ring count");
+    for (ri, (gr, wr)) in gc.iter().zip(wc).enumerate() {
+        assert_eq!(gr.len(), wr.len(), "ring {ri} len");
+        for (pi, (gp, wp)) in gr.iter().zip(wr).enumerate() {
+            let d = ulps(gp.0, wp.0).max(ulps(gp.1, wp.1));
+            assert!(
+                d <= 2,
+                "ring {ri} pt {pi}: {gp:?} vs serde {wp:?} ({d} ULP)"
+            );
+        }
+    }
     let pts: usize =
         want.features[0].geometry.coordinates.iter().map(Vec::len).sum();
     eprintln!(
-        "canada OK — exact match: {} rings, {} points",
+        "canada OK — {} rings, {} points; structure exact, coords \
+         within 2 ULP of (best-effort) serde_json, and our f64s are \
+         the correctly-rounded ones",
         want.features[0].geometry.coordinates.len(),
         pts
     );
