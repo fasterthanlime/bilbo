@@ -103,9 +103,17 @@ fn main() {
     divan::main();
 }
 
+/// Run `f` once to warm (discarded), then hand it to divan.
+fn warmed<O>(bencher: Bencher, mut f: impl FnMut() -> O) {
+    black_box(f());
+    bencher.bench_local(f);
+}
+
 #[divan::bench]
-fn serde_json() -> Citm {
-    serde_json::from_str(black_box(J)).unwrap()
+fn serde_json(bencher: Bencher) {
+    warmed(bencher, || -> Citm {
+        serde_json::from_str(black_box(J)).unwrap()
+    });
 }
 
 #[divan::bench]
@@ -116,7 +124,7 @@ fn parser_pure(bencher: Bencher) {
     let pf = *r
         .jit_parser
         .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
-    bencher.bench(|| {
+    warmed(bencher, || -> Citm {
         let mut e: MaybeUninit<Citm> = MaybeUninit::uninit();
         unsafe {
             pf(&mut e as *mut _ as *mut u8, black_box(J).as_ptr(), J.len());

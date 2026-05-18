@@ -1,6 +1,7 @@
 //! `&str` -> `Endpoint`, several ways. serde_json / facet-json know the
 //! type at compile time; we recover it from our own DWARF at runtime and
-//! JIT a specialized parser.
+//! JIT a specialized parser. Each bench warms once (JIT compile / cache
+//! fill / facet shape init) before timing, so the mean isn't cold-skewed.
 
 use std::mem::MaybeUninit;
 
@@ -22,23 +23,32 @@ fn main() {
     divan::main();
 }
 
-#[divan::bench]
-fn serde_json() -> Endpoint {
-    serde_json::from_str(black_box(JSON)).unwrap()
+/// Run `f` once to warm (discarded), then hand it to divan.
+fn warmed<O>(bencher: Bencher, mut f: impl FnMut() -> O) {
+    black_box(f());
+    bencher.bench_local(f);
 }
 
 #[divan::bench]
-fn facet_json() -> Endpoint {
-    facet_json::from_str(black_box(JSON)).unwrap()
+fn serde_json(bencher: Bencher) {
+    warmed(bencher, || -> Endpoint {
+        serde_json::from_str(black_box(JSON)).unwrap()
+    });
+}
+
+#[divan::bench]
+fn facet_json(bencher: Bencher) {
+    warmed(bencher, || -> Endpoint {
+        facet_json::from_str(black_box(JSON)).unwrap()
+    });
 }
 
 /// Full ergonomic pipeline: frame-walk + resolve cache + parse + bind.
-/// (`Bencher`-closure form so `from_json`'s one-frame unwind lands on the
-/// closure that actually holds `e`, like criterion's `b.iter`.)
+/// `#[inline(never)]` so `from_json`'s one-frame unwind lands here.
 #[divan::bench]
 #[inline(never)]
 fn dwarf_json(bencher: Bencher) {
-    bencher.bench(|| {
+    warmed(bencher, || -> Endpoint {
         let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
         unsafe {
             dwarf_json::from_json(
@@ -51,8 +61,7 @@ fn dwarf_json(bencher: Bencher) {
 }
 
 /// The cranelift parser called directly — apples-to-apples vs
-/// `serde_json::from_str` (both are bytes -> value; serde's type is
-/// compile-time, ours a one-time resolve).
+/// `serde_json::from_str`.
 #[divan::bench]
 #[inline(never)]
 fn parser_pure(bencher: Bencher) {
@@ -61,7 +70,7 @@ fn parser_pure(bencher: Bencher) {
     let pf = *r
         .jit_parser
         .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
-    bencher.bench(|| {
+    warmed(bencher, || -> Endpoint {
         let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
         unsafe {
             pf(&mut e as *mut _ as *mut u8, black_box(JSON).as_ptr(), JSON.len());
@@ -72,8 +81,8 @@ fn parser_pure(bencher: Bencher) {
 
 /// Just our naive parser (no bind), for the breakdown.
 #[divan::bench]
-fn parse_only() -> dwarf_json::json::Json {
-    dwarf_json::json::parse(black_box(JSON))
+fn parse_only(bencher: Bencher) {
+    warmed(bencher, || dwarf_json::json::parse(black_box(JSON)));
 }
 
 /// Just the interpreter bind step, type + JSON pre-resolved.
@@ -83,7 +92,7 @@ fn bind_only_interp(bencher: Bencher) {
     let mut warm: MaybeUninit<Endpoint> = MaybeUninit::uninit();
     let r = unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
     let parsed = dwarf_json::json::parse(JSON);
-    bencher.bench(|| {
+    warmed(bencher, || -> Endpoint {
         let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
         unsafe {
             dwarf_json::interp::run(
