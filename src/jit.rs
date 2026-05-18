@@ -14,7 +14,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value, types,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 
@@ -282,6 +282,11 @@ fn collect_cells(
         _ => {}
     }
 }
+
+/// At/above this many struct fields, dispatch keys with a length-keyed
+/// `br_table` instead of a linear compare chain. Below it the chain is
+/// already optimal (and avoids the search-tree overhead).
+const SWITCH_MIN_FIELDS: usize = 12;
 
 /// Constants available to every node of the emit: the end-of-input pointer
 /// and the address of the 16-byte shim scratch area.
@@ -980,58 +985,109 @@ impl Emit<'_, '_> {
         let after = self.b.create_block();
         self.b.append_block_param(after, types::I64);
 
-        // One then-block per field, reachable from both the fast and slow
-        // dispatch chains; and one skip block for an unknown key.
+        // One then-block per field, reachable from every dispatch path;
+        // and one skip block for an unknown key.
         let then_blocks: Vec<_> =
             fields.iter().map(|_| self.b.create_block()).collect();
         let skip_b = self.b.create_block();
 
-        // Fast path: if the key has >=8 bytes of slack before EOF, load it
-        // as a single word and compare against the constant field names
-        // (serde-style) instead of re-reading it byte-by-byte per field.
-        let kp8 = self.b.ins().iadd_imm(kp, 8);
-        let can_word =
-            self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, kp8, p.end);
-        let fast_b = self.b.create_block();
-        let slow_b = self.b.create_block();
-        self.b.ins().brif(can_word, fast_b, &[], slow_b, &[]);
+        // Wide structs (twitter's `User` is 41 fields, `Status` 25): an
+        // N-deep linear word-compare chain costs O(N) per key. Instead,
+        // dispatch in O(1) on the key *length* via a `br_table`, then run
+        // a tiny per-length compare chain. Natural field names spread
+        // across many lengths, so the buckets stay small (≤3 even for
+        // `User`). Length-keying is robust where a fixed-width byte
+        // prefix would alias JSON punctuation for short names (`id`).
+        if fields.len() >= SWITCH_MIN_FIELDS {
+            let mut by_len: std::collections::BTreeMap<usize, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (i, f) in fields.iter().enumerate() {
+                by_len.entry(f.name.len()).or_default().push(i);
+            }
+            let mut sw = Switch::new();
+            let mut buckets = Vec::with_capacity(by_len.len());
+            for (&len, idxs) in &by_len {
+                let blk = self.b.create_block();
+                sw.set_entry(len as u128, blk);
+                buckets.push((blk, idxs.clone()));
+            }
+            // Default (no field of that length) -> skip the value.
+            sw.emit(self.b, kl, skip_b);
+            for (blk, idxs) in buckets {
+                self.b.switch_to_block(blk);
+                for &i in &idxs {
+                    let cond =
+                        self.keyeq(kp, kl, fields[i].name.as_bytes());
+                    let next = self.b.create_block();
+                    self.b.ins().brif(
+                        cond,
+                        then_blocks[i],
+                        &[],
+                        next,
+                        &[],
+                    );
+                    self.b.switch_to_block(next);
+                }
+                self.b.ins().jump(skip_b, &[]);
+            }
+        } else {
+            // Narrow struct: a linear chain is already optimal and avoids
+            // the search-tree overhead. Fast path: if the key has >=8
+            // bytes of slack before EOF, load it as one word and compare
+            // against the constant field names (serde-style) instead of
+            // re-reading it byte-by-byte per field.
+            let kp8 = self.b.ins().iadd_imm(kp, 8);
+            let can_word = self.b.ins().icmp(
+                IntCC::UnsignedLessThanOrEqual,
+                kp8,
+                p.end,
+            );
+            let fast_b = self.b.create_block();
+            let slow_b = self.b.create_block();
+            self.b.ins().brif(can_word, fast_b, &[], slow_b, &[]);
 
-        self.b.switch_to_block(fast_b);
-        let w = self.b.ins().load(types::I64, MemFlags::trusted(), kp, 0);
-        for (f, &then_b) in fields.iter().zip(&then_blocks) {
-            let name = f.name.as_bytes();
-            let cond = if name.len() <= 8 {
-                let mut wb = [0u8; 8];
-                wb[..name.len()].copy_from_slice(name);
-                let word = u64::from_le_bytes(wb) as i64;
-                let mask = if name.len() == 8 {
-                    -1i64
+            self.b.switch_to_block(fast_b);
+            let w =
+                self.b.ins().load(types::I64, MemFlags::trusted(), kp, 0);
+            for (f, &then_b) in fields.iter().zip(&then_blocks) {
+                let name = f.name.as_bytes();
+                let cond = if name.len() <= 8 {
+                    let mut wb = [0u8; 8];
+                    wb[..name.len()].copy_from_slice(name);
+                    let word = u64::from_le_bytes(wb) as i64;
+                    let mask = if name.len() == 8 {
+                        -1i64
+                    } else {
+                        ((1u64 << (8 * name.len())) - 1) as i64
+                    };
+                    let lc = self.b.ins().icmp_imm(
+                        IntCC::Equal,
+                        kl,
+                        name.len() as i64,
+                    );
+                    let wm = self.b.ins().band_imm(w, mask);
+                    let we =
+                        self.b.ins().icmp_imm(IntCC::Equal, wm, word);
+                    self.b.ins().band(lc, we)
                 } else {
-                    ((1u64 << (8 * name.len())) - 1) as i64
+                    self.keyeq(kp, kl, name)
                 };
-                let lc =
-                    self.b.ins().icmp_imm(IntCC::Equal, kl, name.len() as i64);
-                let wm = self.b.ins().band_imm(w, mask);
-                let we = self.b.ins().icmp_imm(IntCC::Equal, wm, word);
-                self.b.ins().band(lc, we)
-            } else {
-                self.keyeq(kp, kl, name)
-            };
-            let next = self.b.create_block();
-            self.b.ins().brif(cond, then_b, &[], next, &[]);
-            self.b.switch_to_block(next);
-        }
-        self.b.ins().jump(skip_b, &[]);
+                let next = self.b.create_block();
+                self.b.ins().brif(cond, then_b, &[], next, &[]);
+                self.b.switch_to_block(next);
+            }
+            self.b.ins().jump(skip_b, &[]);
 
-        // Slow path (key within 8 bytes of EOF): byte-wise compare.
-        self.b.switch_to_block(slow_b);
-        for (f, &then_b) in fields.iter().zip(&then_blocks) {
-            let cond = self.keyeq(kp, kl, f.name.as_bytes());
-            let next = self.b.create_block();
-            self.b.ins().brif(cond, then_b, &[], next, &[]);
-            self.b.switch_to_block(next);
+            // Slow path (key within 8 bytes of EOF): byte-wise compare.
+            self.b.switch_to_block(slow_b);
+            for (f, &then_b) in fields.iter().zip(&then_blocks) {
+                let cond = self.keyeq(kp, kl, f.name.as_bytes());
+                let next = self.b.create_block();
+                self.b.ins().brif(cond, then_b, &[], next, &[]);
+                self.b.switch_to_block(next);
+            }
+            self.b.ins().jump(skip_b, &[]);
         }
-        self.b.ins().jump(skip_b, &[]);
 
         for (f, &then_b) in fields.iter().zip(&then_blocks) {
             self.b.switch_to_block(then_b);
