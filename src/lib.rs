@@ -24,10 +24,12 @@ use std::sync::Arc;
 
 pub use resolve::Resolved;
 
-/// Opt-in tracing for diagnostics (used by the demo and benches).
+/// Opt-in tracing for benches: WARN only, so failure diagnostics show but
+/// cranelift's verbose `log::info!("defining function …")` (the whole CLIF)
+/// doesn't flood benchmark output. (The demo sets its own TRACE subscriber.)
 pub fn debug_init() {
     let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::WARN)
         .with_target(false)
         .without_time()
         .try_init();

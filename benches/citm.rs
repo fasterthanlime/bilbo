@@ -6,10 +6,9 @@
 #![allow(non_snake_case)]
 
 use std::collections::BTreeMap;
-use std::hint::black_box;
 use std::mem::MaybeUninit;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use divan::{Bencher, black_box};
 use serde::Deserialize;
 
 type Map<V> = BTreeMap<String, V>;
@@ -75,7 +74,7 @@ struct Area {
 
 const J: &str = include_str!("../tests/data/citm_catalog.json");
 
-fn bench(c: &mut Criterion) {
+fn main() {
     dwarf_json::debug_init();
     // The one honest caveat: the real std BTreeMap is built via trampolines,
     // monomorphized once per value type.
@@ -83,7 +82,7 @@ fn bench(c: &mut Criterion) {
     dwarf_json::tramp::force::<Event>();
     dwarf_json::tramp::force::<Vec<u32>>();
 
-    // Correctness: our parser must produce exactly what serde produces.
+    // Correctness gate: our parser must produce exactly what serde does.
     let want: Citm = serde_json::from_str(J).unwrap();
     let mut got: MaybeUninit<Citm> = MaybeUninit::uninit();
     let got = unsafe {
@@ -101,38 +100,27 @@ fn bench(c: &mut Criterion) {
     );
     drop(got);
 
-    let mut g = c.benchmark_group("citm");
-    g.sample_size(40);
+    divan::main();
+}
 
-    g.bench_function("serde_json", |b| {
-        b.iter(|| {
-            let v: Citm = serde_json::from_str(black_box(J)).unwrap();
-            black_box(v);
-        })
-    });
+#[divan::bench]
+fn serde_json() -> Citm {
+    serde_json::from_str(black_box(J)).unwrap()
+}
 
-    // Resolve+compile once; measure the cranelift parser directly.
+#[divan::bench]
+#[inline(never)]
+fn parser_pure(bencher: Bencher) {
     let mut warm: MaybeUninit<Citm> = MaybeUninit::uninit();
     let r = unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
     let pf = *r
         .jit_parser
         .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
-    g.bench_function("parser_pure", |b| {
-        b.iter(|| {
-            let mut e: MaybeUninit<Citm> = MaybeUninit::uninit();
-            unsafe {
-                pf(
-                    &mut e as *mut _ as *mut u8,
-                    black_box(J).as_ptr(),
-                    J.len(),
-                );
-                black_box(e.assume_init());
-            }
-        })
+    bencher.bench(|| {
+        let mut e: MaybeUninit<Citm> = MaybeUninit::uninit();
+        unsafe {
+            pf(&mut e as *mut _ as *mut u8, black_box(J).as_ptr(), J.len());
+            e.assume_init()
+        }
     });
-
-    g.finish();
 }
-
-criterion_group!(benches, bench);
-criterion_main!(benches);
