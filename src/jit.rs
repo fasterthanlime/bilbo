@@ -221,6 +221,21 @@ impl Emit<'_, '_> {
     fn store_at(&mut self, base: Value, off: usize, v: Value) {
         self.b.ins().store(MemFlags::trusted(), v, base, off as i32);
     }
+    /// Copy a `ty`-wide chunk from `src+off` to `dst+off` (possibly
+    /// unaligned). Used by [`emit_copy`]'s overlapping small-copy.
+    fn cp(
+        &mut self,
+        src: Value,
+        dst: Value,
+        ty: cranelift_codegen::ir::Type,
+        off: Value,
+    ) {
+        let mf = MemFlags::new();
+        let sa = self.b.ins().iadd(src, off);
+        let da = self.b.ins().iadd(dst, off);
+        let v = self.b.ins().load(ty, mf, sa, 0);
+        self.b.ins().store(mf, v, da, 0);
+    }
     fn store_sized(&mut self, dst: Value, v: Value, n: u8) {
         let t = match n {
             1 => types::I8,
@@ -236,55 +251,71 @@ impl Emit<'_, '_> {
         self.b.ins().store(MemFlags::trusted(), v, dst, 0);
     }
 
-    /// Inline `memcpy(dst, src, len)`: an 8-byte word loop then a byte
-    /// tail. No libc `memmove` call (which dominated short-string copies).
-    /// Leaves the builder on a fresh continuation block.
+    /// Copy `len` bytes, no libc call, no per-byte loop. The standard
+    /// small-`memcpy` ladder: for `len >= 8`, an 8-byte word loop plus a
+    /// single overlapping trailing word; for `len < 8`, overlapping
+    /// power-of-two copies (4/2/1). Leaves the builder on a fresh block.
     fn emit_copy(&mut self, dst: Value, src: Value, len: Value) {
-        let untrusted = MemFlags::new(); // src/dst may be unaligned
+        // `zero` must dominate both the big and small branches.
+        let zero = self.iconst(0);
+        let big = self.b.create_block(); // len >= 8
+        let small = self.b.create_block(); // len < 8
+        let done = self.b.create_block();
+        let ge8 = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 8);
+        self.b.ins().brif(ge8, big, &[], small, &[]);
+
+        // big: word loop while i+8 <= len, then one overlapping word at len-8.
+        self.b.switch_to_block(big);
         let wh = self.b.create_block();
-        self.b.append_block_param(wh, types::I64); // i
+        self.b.append_block_param(wh, types::I64);
         let wb = self.b.create_block();
         self.b.append_block_param(wb, types::I64);
-        let bh = self.b.create_block();
-        self.b.append_block_param(bh, types::I64);
-        let bb = self.b.create_block();
-        self.b.append_block_param(bb, types::I64);
-        let done = self.b.create_block();
-
-        let zero = self.iconst(0);
+        let tail = self.b.create_block();
         self.b.ins().jump(wh, &[zero.into()]);
-
-        // word loop: while i + 8 <= len
         self.b.switch_to_block(wh);
         let i = self.b.block_params(wh)[0];
         let i8 = self.b.ins().iadd_imm(i, 8);
         let fits =
             self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, i8, len);
-        self.b.ins().brif(fits, wb, &[i.into()], bh, &[i.into()]);
-
+        self.b.ins().brif(fits, wb, &[i.into()], tail, &[]);
         self.b.switch_to_block(wb);
         let i = self.b.block_params(wb)[0];
-        let sa = self.b.ins().iadd(src, i);
-        let da = self.b.ins().iadd(dst, i);
-        let v = self.b.ins().load(types::I64, untrusted, sa, 0);
-        self.b.ins().store(untrusted, v, da, 0);
+        self.cp(src, dst, types::I64, i);
         let i2 = self.b.ins().iadd_imm(i, 8);
         self.b.ins().jump(wh, &[i2.into()]);
+        self.b.switch_to_block(tail);
+        let l8 = self.b.ins().iadd_imm(len, -8);
+        self.cp(src, dst, types::I64, l8);
+        self.b.ins().jump(done, &[]);
 
-        // byte tail: while i < len
-        self.b.switch_to_block(bh);
-        let i = self.b.block_params(bh)[0];
-        let lt = self.b.ins().icmp(IntCC::UnsignedLessThan, i, len);
-        self.b.ins().brif(lt, bb, &[i.into()], done, &[]);
-
-        self.b.switch_to_block(bb);
-        let i = self.b.block_params(bb)[0];
-        let sa = self.b.ins().iadd(src, i);
-        let da = self.b.ins().iadd(dst, i);
-        let v = self.b.ins().load(types::I8, untrusted, sa, 0);
-        self.b.ins().store(untrusted, v, da, 0);
-        let i2 = self.b.ins().iadd_imm(i, 1);
-        self.b.ins().jump(bh, &[i2.into()]);
+        // small: len in 0..=7, overlapping 4/2/1.
+        self.b.switch_to_block(small);
+        let s2 = self.b.create_block();
+        let s4 = self.b.create_block();
+        let ge4 = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 4);
+        self.b.ins().brif(ge4, s4, &[], s2, &[]);
+        self.b.switch_to_block(s4); // 4..=7: u32@0 + u32@len-4
+        self.cp(src, dst, types::I32, zero);
+        let l4 = self.b.ins().iadd_imm(len, -4);
+        self.cp(src, dst, types::I32, l4);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(s2);
+        let do2 = self.b.create_block();
+        let s1 = self.b.create_block();
+        let ge2 = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 2);
+        self.b.ins().brif(ge2, do2, &[], s1, &[]);
+        self.b.switch_to_block(do2); // 2..=3: u16@0 + u16@len-2
+        self.cp(src, dst, types::I16, zero);
+        let l2 = self.b.ins().iadd_imm(len, -2);
+        self.cp(src, dst, types::I16, l2);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(s1); // 0..=1
+        let one = self.b.create_block();
+        let nz = self.b.ins().icmp_imm(IntCC::NotEqual, len, 0);
+        self.b.ins().brif(nz, one, &[], done, &[]);
+        self.b.switch_to_block(one);
+        self.cp(src, dst, types::I8, zero);
+        self.b.ins().jump(done, &[]);
 
         self.b.switch_to_block(done);
     }
