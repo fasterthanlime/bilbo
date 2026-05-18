@@ -27,11 +27,21 @@ pub struct Caller {
 
 type Unw = UnwinderAarch64<&'static [u8]>;
 
-/// Capture this frame's registers and unwind exactly one frame to the caller.
-/// `#[inline(always)]` so the captured pc/sp/fp belong to the *public*
-/// function the user actually called (`from_json` / `resolve`).
+/// The registers of the public function the user called, captured cheaply.
+/// `framehop` is *not* run here — that only happens on a cache miss.
+#[derive(Debug, Clone, Copy)]
+pub struct Raw {
+    pub pc: u64,
+    pub sp: u64,
+    pub fp: u64,
+    pub lr: u64,
+}
+
+/// Capture this frame's registers. `#[inline(always)]` so they belong to the
+/// *public* function the user actually called (`from_json` / `resolve`),
+/// which has a real frame record (forced frame pointers + `#[inline(never)]`).
 #[inline(always)]
-pub fn caller() -> Caller {
+pub fn raw() -> Raw {
     let (pc, sp, fp, lr): (u64, u64, u64, u64);
     // Safety: reading our own pc/sp/x29/x30.
     unsafe {
@@ -47,7 +57,22 @@ pub fn caller() -> Caller {
             options(nomem, nostack),
         );
     }
-    unwind_one(pc, sp, fp, lr)
+    Raw { pc, sp, fp, lr }
+}
+
+/// The cache key: the caller's return address, de-ASLR'd. This is just the
+/// `lr` slot of our own AAPCS64 frame record (`*(fp + 8)`) — two loads, no
+/// unwinding. Same value `framehop` would return as the caller PC.
+#[inline(always)]
+pub fn caller_pc(r: Raw) -> u64 {
+    let ret = unsafe { *((r.fp + 8) as *const u64) };
+    ret - main_image_slide()
+}
+
+/// The cold path: actually unwind one frame (CFI-correct, works under `-O3`)
+/// to recover the caller's `sp`/`fp` so we can locate the aliased local.
+pub fn unwind(r: Raw) -> Caller {
+    unwind_one(r.pc, r.sp, r.fp, r.lr)
 }
 
 fn unwind_one(pc: u64, sp: u64, fp: u64, lr: u64) -> Caller {

@@ -72,7 +72,7 @@ fn bench(c: &mut Criterion) {
     {
         // Resolve + parse once; measure only the bind step.
         let mut warm: MaybeUninit<Endpoint> = MaybeUninit::uninit();
-        let plan =
+        let r =
             unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
         let parsed = dwarf_json::json::parse(JSON);
 
@@ -82,7 +82,7 @@ fn bench(c: &mut Criterion) {
                 unsafe {
                     dwarf_json::interp::run(
                         &mut e as *mut _ as *mut u8,
-                        &plan,
+                        &r.ty,
                         &parsed,
                     );
                     black_box(e.assume_init());
@@ -90,7 +90,7 @@ fn bench(c: &mut Criterion) {
             })
         });
 
-        let f = dwarf_json::jit::compiled(0xB17, &plan);
+        let f = *r.jit.get_or_init(|| dwarf_json::jit::compile(&r.ty));
         g.bench_function("bind_only_jit", |b| {
             b.iter(|| {
                 let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();

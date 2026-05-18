@@ -23,15 +23,17 @@ thread_local! {
     static JIT: RefCell<Jit> = RefCell::new(Jit::new());
 }
 
-/// Compile (once per call site) and return the specialized function.
-pub fn compiled(key: u64, ty: &Ty) -> Compiled {
-    JIT.with(|j| j.borrow_mut().get(key, ty))
+/// Compile a specialized binder for `ty`. Caching by type lives in
+/// `resolve` (one `Resolved` per type holds the result), so this just
+/// emits code; the thread-local `JITModule` keeps it mapped.
+pub fn compile(ty: &Ty) -> Compiled {
+    JIT.with(|j| j.borrow_mut().compile(ty))
 }
 
 struct Jit {
     module: JITModule,
     shims: Shims,
-    cache: HashMap<u64, Compiled>,
+    seq: u32,
 }
 
 /// `FuncId`s of the runtime shims, declared once in the module.
@@ -102,26 +104,18 @@ impl Jit {
         Jit {
             module,
             shims,
-            cache: HashMap::new(),
+            seq: 0,
         }
     }
 
-    fn get(&mut self, key: u64, ty: &Ty) -> Compiled {
-        if let Some(f) = self.cache.get(&key) {
-            return *f;
-        }
-        let f = self.compile(key, ty);
-        self.cache.insert(key, f);
-        f
-    }
-
-    fn compile(&mut self, key: u64, ty: &Ty) -> Compiled {
+    fn compile(&mut self, ty: &Ty) -> Compiled {
         let p = types::I64;
         let mut ctx = self.module.make_context();
         ctx.func.signature.params.push(AbiParam::new(p)); // dst
         ctx.func.signature.params.push(AbiParam::new(p)); // json
 
-        let name = format!("bind_{key:#x}");
+        self.seq += 1;
+        let name = format!("bind_{}", self.seq);
         let fid = self
             .module
             .declare_function(&name, Linkage::Local, &ctx.func.signature)
