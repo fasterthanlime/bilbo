@@ -1,0 +1,4 @@
+# We walk the frame-pointer chain by hand in `frame.rs`, so the frame pointer
+# must actually be there. Debug arm64 keeps it anyway; this makes it a promise.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
