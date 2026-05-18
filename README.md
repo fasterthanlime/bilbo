@@ -60,7 +60,9 @@ fast.
 3. `classify` turns the type DIE into a self-contained [`plan::Ty`]:
    field offsets, primitive sizes, the real `ptr`/`cap`/`len` offsets
    inside `String`/`Vec` (Rust does not promise their order — we learn
-   it from DWARF), niche `Option`, `()`, tuples, `BTreeMap`.
+   it from DWARF), niche *and* tagged `Option`, `()`, tuples, `Box<T>`,
+   `BTreeMap`, and recursive types (a cycle in the DIE graph becomes a
+   back-edge in `Ty`, tied off with `Arc<OnceLock<Ty>>`).
 4. `resolve.rs` — a two-level cache: call-site PC → type → resolved
    plan + JIT'd function. The deserializer is a property of the *type*,
    not the call site, so two sites filling the same type share one
@@ -71,8 +73,13 @@ fast.
 - `jit.rs` — cranelift compiles a function specialized to the `Ty`:
   field-name bytes and offsets baked in as constants, a `memchr`/
   hybrid-SIMD scanner, the whole parse+bind in one pass, no
-  intermediate `Json` tree. Or `interp.rs`, a plain interpreter over
-  the same `Ty`, kept as a baseline.
+  intermediate `Json` tree. Object keys dispatch through a linear
+  word-compare chain for narrow structs, but a wide struct (twitter's
+  `User` is 41 fields) instead dispatches in O(1) on the key *length*
+  via a `br_table`, then a tiny per-length chain — the difference
+  between losing and winning on twitter. Recursive types compile one
+  function per cycle and call into it. Or `interp.rs`, a plain
+  interpreter over the same `Ty`, kept as a baseline.
 - `jitdump.rs` — emits `/tmp/jit-<pid>.dump` (perf jitdump) so
   profilers (e.g. [stax](https://github.com/bearcove/stax)) can name
   and disassemble the JIT'd code instead of showing `<unresolved>`.
@@ -86,15 +93,16 @@ addresses we resolve — from DWARF, like everything else.
 ## Running it
 
 ```sh
-cargo run                 # the demo: reconstructs an Endpoint, narrates
+cargo run                 # demo: Endpoint + tagged-Option + Box + recursive, narrated
 cargo bench --bench de    # small struct vs serde_json / facet-json
 cargo bench --bench citm  # citm_catalog.json
 cargo bench --bench canada
 cargo bench --bench twitter  # full fidelity: enums, Box, recursion
 ```
 
-Each bench asserts byte-for-byte equality with `serde_json` before
-timing.
+Each bench gates against `serde_json` before timing: byte-for-byte for
+`citm`/`twitter`/`de`, and structure-exact + correctly-rounded floats
+for `canada` (where serde's default parser is the less accurate one).
 
 ## Supported types
 
