@@ -64,15 +64,11 @@ struct Shims {
     str_len: FuncId,
     dup: FuncId,
     alloc: FuncId,
-    // parser-JIT shims (byte scanning; cranelift emits the structure)
-    ws: FuncId,
-    sstr: FuncId,
+    // parser-JIT shims. Byte scanning is emitted inline in cranelift now;
+    // only the genuinely-Rust bits remain: `skip` (unknown key / array
+    // count) and `f64v` (float parsing).
     skip: FuncId,
-    u64v: FuncId,
-    i64v: FuncId,
     f64v: FuncId,
-    boolv: FuncId,
-    keyeq: FuncId,
 }
 
 impl Jit {
@@ -91,14 +87,8 @@ impl Jit {
         b.symbol("rt_str_len", rt_str_len as *const u8);
         b.symbol("rt_dup", rt_dup as *const u8);
         b.symbol("rt_alloc", rt_alloc as *const u8);
-        b.symbol("rt_ws", rt_ws as *const u8);
-        b.symbol("rt_sstr", rt_sstr as *const u8);
         b.symbol("rt_skip", rt_skip as *const u8);
-        b.symbol("rt_u64v", rt_u64v as *const u8);
-        b.symbol("rt_i64v", rt_i64v as *const u8);
         b.symbol("rt_f64v", rt_f64v as *const u8);
-        b.symbol("rt_boolv", rt_boolv as *const u8);
-        b.symbol("rt_keyeq", rt_keyeq as *const u8);
         let mut module = JITModule::new(b);
 
         let p = types::I64;
@@ -129,14 +119,8 @@ impl Jit {
             str_len: decl(&mut module, "rt_str_len", &[p], Some(p)),
             dup: decl(&mut module, "rt_dup", &[p, p], Some(p)),
             alloc: decl(&mut module, "rt_alloc", &[p, p], Some(p)),
-            ws: decl(&mut module, "rt_ws", &[p, p], Some(p)),
-            sstr: decl(&mut module, "rt_sstr", &[p, p, p], Some(p)),
             skip: decl(&mut module, "rt_skip", &[p, p], Some(p)),
-            u64v: decl(&mut module, "rt_u64v", &[p, p, p], Some(p)),
-            i64v: decl(&mut module, "rt_i64v", &[p, p, p], Some(p)),
             f64v: decl(&mut module, "rt_f64v", &[p, p, p], Some(p)),
-            boolv: decl(&mut module, "rt_boolv", &[p, p, p], Some(p)),
-            keyeq: decl(&mut module, "rt_keyeq", &[p, p, p, p], Some(p)),
         };
 
         Jit {
@@ -416,11 +400,6 @@ impl Emit<'_, '_> {
 
     // --- parser JIT: raw bytes -> struct, no Json tree ------------------
 
-    fn call4(&mut self, f: FuncId, a: Value, b: Value, c: Value, d: Value) -> Value {
-        let r = self.module.declare_func_in_func(f, self.b.func);
-        let ci = self.b.ins().call(r, &[a, b, c, d]);
-        self.b.inst_results(ci)[0]
-    }
     fn load_u8(&mut self, addr: Value) -> Value {
         let v = self.b.ins().load(types::I8, MemFlags::trusted(), addr, 0);
         self.b.ins().uextend(types::I64, v)
@@ -428,8 +407,163 @@ impl Emit<'_, '_> {
     fn scratch(&mut self, sc: Value, off: i32) -> Value {
         self.b.ins().load(types::I64, MemFlags::trusted(), sc, off)
     }
+    fn byte_eq(&mut self, b: Value, ch: u8) -> Value {
+        self.b.ins().icmp_imm(IntCC::Equal, b, ch as i64)
+    }
+
+    /// Inline whitespace skip — no shim call. Emits the bounded loop
+    /// `while cur < end && is_ws(*cur) { cur += 1 }` directly in IR.
     fn ws(&mut self, cur: Value, p: &Pctx) -> Value {
-        self.call2(self.shims.ws, cur, p.end)
+        let head = self.b.create_block();
+        self.b.append_block_param(head, types::I64);
+        let chk = self.b.create_block();
+        self.b.append_block_param(chk, types::I64);
+        let cont = self.b.create_block();
+        self.b.append_block_param(cont, types::I64);
+        self.b.ins().jump(head, &[cur.into()]);
+
+        self.b.switch_to_block(head);
+        let c = self.b.block_params(head)[0];
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, p.end);
+        self.b.ins().brif(inb, chk, &[c.into()], cont, &[c.into()]);
+
+        self.b.switch_to_block(chk);
+        let c = self.b.block_params(chk)[0];
+        let b = self.load_u8(c);
+        let e1 = self.byte_eq(b, b' ');
+        let e2 = self.byte_eq(b, b'\n');
+        let e3 = self.byte_eq(b, b'\t');
+        let e4 = self.byte_eq(b, b'\r');
+        let o12 = self.b.ins().bor(e1, e2);
+        let o34 = self.b.ins().bor(e3, e4);
+        let is_ws = self.b.ins().bor(o12, o34);
+        let c1 = self.b.ins().iadd_imm(c, 1);
+        self.b
+            .ins()
+            .brif(is_ws, head, &[c1.into()], cont, &[c.into()]);
+
+        self.b.switch_to_block(cont);
+        self.b.block_params(cont)[0]
+    }
+
+    /// Inline string scan. Returns `(start_ptr, len, cursor_after_quote)`.
+    /// Skips leading ws; handles `\"` so we don't stop early (escapes are
+    /// not unescaped — naive fast path, same as before).
+    fn strspan(&mut self, cur: Value, p: &Pctx) -> (Value, Value, Value) {
+        let cur = self.ws(cur, p);
+        let start = self.b.ins().iadd_imm(cur, 1); // past opening quote
+
+        let head = self.b.create_block();
+        self.b.append_block_param(head, types::I64);
+        let chk = self.b.create_block();
+        self.b.append_block_param(chk, types::I64);
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.ins().jump(head, &[start.into()]);
+
+        self.b.switch_to_block(head);
+        let q = self.b.block_params(head)[0];
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, q, p.end);
+        self.b.ins().brif(inb, chk, &[q.into()], done, &[q.into()]);
+
+        self.b.switch_to_block(chk);
+        let q = self.b.block_params(chk)[0];
+        let b = self.load_u8(q);
+        let is_quote = self.byte_eq(b, b'"');
+        let is_bs = self.byte_eq(b, b'\\');
+        let q1 = self.b.ins().iadd_imm(q, 1);
+        let q2 = self.b.ins().iadd_imm(q, 2);
+        let qn = self.b.ins().select(is_bs, q2, q1);
+        self.b
+            .ins()
+            .brif(is_quote, done, &[q.into()], head, &[qn.into()]);
+
+        self.b.switch_to_block(done);
+        let qend = self.b.block_params(done)[0];
+        let len = self.b.ins().isub(qend, start);
+        let after = self.b.ins().iadd_imm(qend, 1);
+        (start, len, after)
+    }
+
+    /// Inline integer scan. Returns `(value, cursor_after)`.
+    fn intval(&mut self, cur: Value, p: &Pctx, signed: bool) -> (Value, Value) {
+        let cur = self.ws(cur, p);
+        // optional sign
+        let b0 = self.load_u8(cur);
+        let neg = if signed {
+            self.byte_eq(b0, b'-')
+        } else {
+            self.b.ins().iconst(types::I8, 0)
+        };
+        let is_plus = self.byte_eq(b0, b'+');
+        let is_sign = self.b.ins().bor(neg, is_plus);
+        let cur1 = self.b.ins().iadd_imm(cur, 1);
+        let cur = self.b.ins().select(is_sign, cur1, cur);
+
+        let head = self.b.create_block();
+        self.b.append_block_param(head, types::I64); // cursor
+        self.b.append_block_param(head, types::I64); // acc
+        let chk = self.b.create_block();
+        self.b.append_block_param(chk, types::I64);
+        self.b.append_block_param(chk, types::I64);
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param(done, types::I64);
+        let zero = self.iconst(0);
+        self.b.ins().jump(head, &[cur.into(), zero.into()]);
+
+        self.b.switch_to_block(head);
+        let c = self.b.block_params(head)[0];
+        let v = self.b.block_params(head)[1];
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, p.end);
+        self.b
+            .ins()
+            .brif(inb, chk, &[c.into(), v.into()], done, &[c.into(), v.into()]);
+
+        self.b.switch_to_block(chk);
+        let c = self.b.block_params(chk)[0];
+        let v = self.b.block_params(chk)[1];
+        let b = self.load_u8(c);
+        let d = self.b.ins().iadd_imm(b, -(b'0' as i64));
+        let is_dig = self.b.ins().icmp_imm(IntCC::UnsignedLessThan, d, 10);
+        let v10 = self.b.ins().imul_imm(v, 10);
+        let vn = self.b.ins().iadd(v10, d);
+        let c1 = self.b.ins().iadd_imm(c, 1);
+        self.b.ins().brif(
+            is_dig,
+            head,
+            &[c1.into(), vn.into()],
+            done,
+            &[c.into(), v.into()],
+        );
+
+        self.b.switch_to_block(done);
+        let cend = self.b.block_params(done)[0];
+        let val = self.b.block_params(done)[1];
+        let val = if signed {
+            let negd = self.b.ins().ineg(val);
+            self.b.ins().select(neg, negd, val)
+        } else {
+            val
+        };
+        (val, cend)
+    }
+
+    /// Inline, fully-unrolled comparison of the scanned key bytes against a
+    /// compile-time-constant field name. No shim, no loop.
+    fn keyeq(&mut self, kp: Value, kl: Value, name: &[u8]) -> Value {
+        let mut acc =
+            self.b.ins().icmp_imm(IntCC::Equal, kl, name.len() as i64);
+        for (i, &ch) in name.iter().enumerate() {
+            let byte =
+                self.b
+                    .ins()
+                    .load(types::I8, MemFlags::trusted(), kp, i as i32);
+            let byte = self.b.ins().uextend(types::I64, byte);
+            let eqi = self.byte_eq(byte, ch);
+            acc = self.b.ins().band(acc, eqi);
+        }
+        acc
     }
 
     /// Emit code to parse one JSON value at `cur` into `dst`; returns the
@@ -437,20 +571,21 @@ impl Emit<'_, '_> {
     fn parse(&mut self, ty: &Ty, dst: Value, cur: Value, p: &Pctx) -> Value {
         match ty {
             Ty::Bool => {
-                let c = self.call3(self.shims.boolv, cur, p.end, p.sc);
-                let v = self.scratch(p.sc, 0);
-                let v = self.b.ins().ireduce(types::I8, v);
+                let c = self.ws(cur, p);
+                let b = self.load_u8(c);
+                let is_t = self.byte_eq(b, b't');
+                let is_f = self.byte_eq(b, b'f');
+                let v = self.b.ins().ireduce(types::I8, is_t);
                 self.b.ins().store(MemFlags::trusted(), v, dst, 0);
-                c
+                // "true"=4, "false"=5, "null"=4
+                let five = self.iconst(5);
+                let four = self.iconst(4);
+                let adv = self.b.ins().select(is_f, five, four);
+                self.b.ins().iadd(c, adv)
             }
             Ty::U(n) | Ty::I(n) => {
-                let shim = if matches!(ty, Ty::I(_)) {
-                    self.shims.i64v
-                } else {
-                    self.shims.u64v
-                };
-                let c = self.call3(shim, cur, p.end, p.sc);
-                let v = self.scratch(p.sc, 0);
+                let signed = matches!(ty, Ty::I(_));
+                let (v, c) = self.intval(cur, p, signed);
                 self.store_sized(dst, v, *n);
                 c
             }
@@ -472,17 +607,14 @@ impl Emit<'_, '_> {
             }
             Ty::Char => {
                 // naive: a one-char string
-                let c = self.call3(self.shims.sstr, cur, p.end, p.sc);
-                let sp = self.scratch(p.sc, 0);
+                let (sp, _sl, c) = self.strspan(cur, p);
                 let ch = self.load_u8(sp);
                 let ch = self.b.ins().ireduce(types::I32, ch);
                 self.b.ins().store(MemFlags::trusted(), ch, dst, 0);
                 c
             }
             Ty::Str(seq) => {
-                let c = self.call3(self.shims.sstr, cur, p.end, p.sc);
-                let sp = self.scratch(p.sc, 0);
-                let sl = self.scratch(p.sc, 8);
+                let (sp, sl, c) = self.strspan(cur, p);
                 let buf = self.call2(self.shims.dup, sp, sl);
                 self.store_at(dst, seq.ptr_off, buf);
                 self.store_at(dst, seq.cap_off, sl);
@@ -490,9 +622,7 @@ impl Emit<'_, '_> {
                 c
             }
             Ty::StrRef { ptr_off, len_off } => {
-                let c = self.call3(self.shims.sstr, cur, p.end, p.sc);
-                let sp = self.scratch(p.sc, 0);
-                let sl = self.scratch(p.sc, 8);
+                let (sp, sl, c) = self.strspan(cur, p);
                 let buf = self.call2(self.shims.dup, sp, sl);
                 self.store_at(dst, *ptr_off, buf);
                 self.store_at(dst, *len_off, sl);
@@ -554,11 +684,9 @@ impl Emit<'_, '_> {
             .brif(is_end, cont, &[hc_past.into()], body, &[hc.into()]);
 
         self.b.switch_to_block(body);
-        let mut c = self.b.block_params(body)[0];
-        // key span
-        c = self.call3(self.shims.sstr, c, p.end, p.sc);
-        let kp = self.scratch(p.sc, 0);
-        let kl = self.scratch(p.sc, 8);
+        let bc = self.b.block_params(body)[0];
+        // key span (inline)
+        let (kp, kl, mut c) = self.strspan(bc, p);
         // skip ws, past ':'
         c = self.ws(c, p);
         c = self.b.ins().iadd_imm(c, 1);
@@ -567,11 +695,7 @@ impl Emit<'_, '_> {
         self.b.append_block_param(after, types::I64);
 
         for f in fields {
-            let (kptr, klen) = leak_key(&f.name);
-            let kpc = self.iconst(kptr as i64);
-            let klc = self.iconst(klen as i64);
-            let eq = self.call4(self.shims.keyeq, kp, kl, kpc, klc);
-            let cond = self.b.ins().icmp_imm(IntCC::NotEqual, eq, 0);
+            let cond = self.keyeq(kp, kl, f.name.as_bytes());
             let then_b = self.b.create_block();
             let else_b = self.b.create_block();
             self.b.ins().brif(cond, then_b, &[], else_b, &[]);
@@ -812,29 +936,6 @@ unsafe extern "C" fn rt_ws(mut cur: *const u8, end: *const u8) -> *const u8 {
 /// At a string: write (ptr,len) of the bytes between the quotes into `sc`,
 /// return the cursor past the closing quote. Escapes are not unescaped
 /// (naive fast path); `\"` is still handled so we don't stop early.
-unsafe extern "C" fn rt_sstr(
-    cur: *const u8,
-    end: *const u8,
-    sc: *mut u64,
-) -> *const u8 {
-    let cur = unsafe { rt_ws(cur, end) };
-    debug_assert_eq!(unsafe { *cur }, b'"');
-    let s = unsafe { cur.add(1) };
-    let mut p = s;
-    while p < end && unsafe { *p } != b'"' {
-        p = if unsafe { *p } == b'\\' {
-            unsafe { p.add(2) }
-        } else {
-            unsafe { p.add(1) }
-        };
-    }
-    unsafe {
-        *sc = s as u64;
-        *sc.add(1) = (p as usize - s as usize) as u64;
-    }
-    unsafe { p.add(1) }
-}
-
 /// Skip one JSON value; return the cursor just past it.
 unsafe extern "C" fn rt_skip(cur: *const u8, end: *const u8) -> *const u8 {
     let mut cur = unsafe { rt_ws(cur, end) };
@@ -897,55 +998,6 @@ unsafe extern "C" fn rt_skip(cur: *const u8, end: *const u8) -> *const u8 {
     }
 }
 
-unsafe extern "C" fn rt_u64v(
-    cur: *const u8,
-    end: *const u8,
-    sc: *mut u64,
-) -> *const u8 {
-    let mut cur = unsafe { rt_ws(cur, end) };
-    if cur < end && unsafe { *cur } == b'+' {
-        cur = unsafe { cur.add(1) };
-    }
-    let mut v: u64 = 0;
-    while cur < end {
-        let c = unsafe { *cur };
-        if !c.is_ascii_digit() {
-            break;
-        }
-        v = v * 10 + (c - b'0') as u64;
-        cur = unsafe { cur.add(1) };
-    }
-    unsafe { *sc = v };
-    cur
-}
-
-unsafe extern "C" fn rt_i64v(
-    cur: *const u8,
-    end: *const u8,
-    sc: *mut u64,
-) -> *const u8 {
-    let mut cur = unsafe { rt_ws(cur, end) };
-    let mut neg = false;
-    if cur < end && (unsafe { *cur } == b'-' || unsafe { *cur } == b'+') {
-        neg = unsafe { *cur } == b'-';
-        cur = unsafe { cur.add(1) };
-    }
-    let mut v: i64 = 0;
-    while cur < end {
-        let c = unsafe { *cur };
-        if !c.is_ascii_digit() {
-            break;
-        }
-        v = v * 10 + (c - b'0') as i64;
-        cur = unsafe { cur.add(1) };
-    }
-    if neg {
-        v = -v;
-    }
-    unsafe { *sc = v as u64 };
-    cur
-}
-
 unsafe extern "C" fn rt_f64v(
     cur: *const u8,
     end: *const u8,
@@ -970,40 +1022,4 @@ unsafe extern "C" fn rt_f64v(
         .unwrap_or(0.0);
     unsafe { *sc = f.to_bits() };
     p
-}
-
-unsafe extern "C" fn rt_boolv(
-    cur: *const u8,
-    end: *const u8,
-    sc: *mut u64,
-) -> *const u8 {
-    let cur = unsafe { rt_ws(cur, end) };
-    match unsafe { *cur } {
-        b't' => {
-            unsafe { *sc = 1 };
-            unsafe { cur.add(4) }
-        }
-        b'f' => {
-            unsafe { *sc = 0 };
-            unsafe { cur.add(5) }
-        }
-        _ => {
-            unsafe { *sc = 0 };
-            unsafe { cur.add(4) } // null
-        }
-    }
-}
-
-unsafe extern "C" fn rt_keyeq(
-    a: *const u8,
-    alen: usize,
-    b: *const u8,
-    blen: usize,
-) -> u64 {
-    if alen != blen {
-        return 0;
-    }
-    let x = unsafe { std::slice::from_raw_parts(a, alen) };
-    let y = unsafe { std::slice::from_raw_parts(b, blen) };
-    (x == y) as u64
 }
