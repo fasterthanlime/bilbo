@@ -3,4 +3,14 @@ name = "dwarf_json"
 version = "0.1.0"
 edition = "2024"
 
+[profile.dev]
+# Generate a unified .dSYM bundle so we can read our own DWARF at runtime.
+split-debuginfo = "packed"
+
 [dependencies]
+backtrace = "0.3.76"
+gimli = "0.33.0"
+memmap2 = "0.9.10"
+object = "0.39.1"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
