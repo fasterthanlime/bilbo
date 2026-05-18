@@ -49,8 +49,6 @@ struct Shims {
     skip: FuncId,     // skip an unknown object value
     f64v: FuncId,     // parse a float
     unescape: FuncId, // decode a JSON string with escapes
-    wsskip: FuncId,   // SIMD whitespace skip
-    strscan: FuncId,  // SIMD string-span (memchr2 '"' '\\')
 }
 
 impl Jit {
@@ -62,8 +60,6 @@ impl Jit {
         b.symbol("rt_skip", rt_skip as *const u8);
         b.symbol("rt_f64v", rt_f64v as *const u8);
         b.symbol("rt_unescape", rt_unescape as *const u8);
-        b.symbol("rt_wsskip", rt_wsskip as *const u8);
-        b.symbol("rt_strscan", rt_strscan as *const u8);
         let mut module = JITModule::new(b);
 
         let p = types::I64;
@@ -87,8 +83,6 @@ impl Jit {
             skip: decl(&mut module, "rt_skip", &[p, p], Some(p)),
             f64v: decl(&mut module, "rt_f64v", &[p, p, p], Some(p)),
             unescape: decl(&mut module, "rt_unescape", &[p, p, p], Some(p)),
-            wsskip: decl(&mut module, "rt_wsskip", &[p, p], Some(p)),
-            strscan: decl(&mut module, "rt_strscan", &[p, p, p], Some(p)),
         };
 
         Jit {
@@ -329,64 +323,177 @@ impl Emit<'_, '_> {
         self.b.switch_to_block(done);
     }
 
-    /// Whitespace skip, hybrid: peel the first two bytes inline (covers the
-    /// common "no whitespace" and "one space after `:`" cases with zero
-    /// calls — this is what compact JSON like Endpoint hits), and only call
-    /// the SIMD shim for a genuine run (pretty-printed indentation).
+    /// Splat a byte across an `I8X16` lane vector.
+    fn splat16(&mut self, byte: u8) -> Value {
+        let s = self.b.ins().iconst(types::I8, byte as i64);
+        self.b.ins().splat(types::I8X16, s)
+    }
+
+    /// Whitespace skip, fully inline NEON. 16-byte chunks: load `I8X16`,
+    /// lane-compare `> 0x20`, `vhigh_bits` -> 16-bit mask, `ctz` -> first
+    /// non-ws byte. Scalar tail for the final < 16 bytes. No shim, no call.
     fn ws(&mut self, cur: Value, p: &Pctx) -> Value {
+        let end = p.end;
+        let sp20 = self.splat16(0x20);
         let cont = self.b.create_block();
         self.b.append_block_param(cont, types::I64);
-        let b1 = self.b.create_block();
-        self.b.append_block_param(b1, types::I64);
-        let slow = self.b.create_block();
-        self.b.append_block_param(slow, types::I64);
+        let l = self.b.create_block();
+        self.b.append_block_param(l, types::I64);
+        let tail = self.b.create_block();
+        self.b.append_block_param(tail, types::I64);
+        self.b.ins().jump(l, &[cur.into()]);
 
-        self.peel_ws(cur, p.end, cont, b1); // byte 0
-        self.b.switch_to_block(b1);
-        let c = self.b.block_params(b1)[0];
-        self.peel_ws(c, p.end, cont, slow); // byte 1
-        self.b.switch_to_block(slow);
-        let c = self.b.block_params(slow)[0];
-        let r = self.call2(self.shims.wsskip, c, p.end);
+        // >= 16 bytes left? (c + 16 <= end, so the vector load is in bounds)
+        self.b.switch_to_block(l);
+        let c = self.b.block_params(l)[0];
+        let c16 = self.b.ins().iadd_imm(c, 16);
+        let v16 = self.b.create_block();
+        let ge = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, c16, end);
+        self.b.ins().brif(ge, v16, &[], tail, &[c.into()]);
+
+        self.b.switch_to_block(v16);
+        let v = self.b.ins().load(types::I8X16, MemFlags::new(), c, 0);
+        let gt = self.b.ins().icmp(IntCC::UnsignedGreaterThan, v, sp20);
+        let bits = self.b.ins().vhigh_bits(types::I32, gt);
+        let nz = self.b.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+        let found = self.b.create_block();
+        let adv = self.b.create_block();
+        self.b.ins().brif(nz, found, &[], adv, &[]);
+        self.b.switch_to_block(found);
+        let idx = self.b.ins().ctz(bits);
+        let idx = self.b.ins().uextend(types::I64, idx);
+        let r = self.b.ins().iadd(c, idx);
         self.b.ins().jump(cont, &[r.into()]);
+        self.b.switch_to_block(adv);
+        self.b.ins().jump(l, &[c16.into()]);
+
+        // scalar tail
+        self.b.switch_to_block(tail);
+        let th = self.b.create_block();
+        self.b.append_block_param(th, types::I64);
+        let tc = self.b.block_params(tail)[0];
+        self.b.ins().jump(th, &[tc.into()]);
+        self.b.switch_to_block(th);
+        let c = self.b.block_params(th)[0];
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, end);
+        let tb = self.b.create_block();
+        self.b.ins().brif(inb, tb, &[], cont, &[c.into()]);
+        self.b.switch_to_block(tb);
+        let b = self.load_u8(c);
+        let isws =
+            self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, b, 0x20);
+        let c1 = self.b.ins().iadd_imm(c, 1);
+        self.b.ins().brif(isws, th, &[c1.into()], cont, &[c.into()]);
 
         self.b.switch_to_block(cont);
         self.b.block_params(cont)[0]
     }
 
-    /// One inline whitespace byte: if `*c <= 0x20`, branch to `tail(c+1)`;
-    /// otherwise (or out of bounds) branch to `cont(c)`.
-    fn peel_ws(
-        &mut self,
-        c: Value,
-        end: Value,
-        cont: cranelift_codegen::ir::Block,
-        tail: cranelift_codegen::ir::Block,
-    ) {
-        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, end);
-        let bchk = self.b.create_block();
-        self.b.ins().brif(inb, bchk, &[], cont, &[c.into()]);
-        self.b.switch_to_block(bchk);
-        let v = self.load_u8(c);
-        let is_ws =
-            self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, v, 0x20);
-        let c1 = self.b.ins().iadd_imm(c, 1);
-        self.b.ins().brif(is_ws, tail, &[c1.into()], cont, &[c.into()]);
-    }
-
-    /// String scan via `memchr2('"','\\')`. Returns `(start, len,
-    /// cursor_after_quote, had_escape)`. Skips leading ws first.
+    /// String scan, fully inline NEON: 16-byte chunks find the first `"`
+    /// or `\\`; on `\\` set `esc` and resume after the escaped byte; on
+    /// `"` we're done. Scalar tail for the final < 16 bytes. Returns
+    /// `(start, len, cursor_after_quote, had_escape)`.
     fn strspan(
         &mut self,
         cur: Value,
         p: &Pctx,
     ) -> (Value, Value, Value, Value) {
-        let q = self.ws(cur, p); // at the opening quote
+        let end = p.end;
+        let q = self.ws(cur, p); // opening quote
         let start = self.b.ins().iadd_imm(q, 1);
-        // rt_strscan(q, end, sc) -> after; sc[0]=len, sc[1]=esc
-        let after = self.call3(self.shims.strscan, q, p.end, p.sc);
-        let len = self.scratch(p.sc, 0);
-        let esc = self.scratch(p.sc, 8);
+        let spq = self.splat16(b'"');
+        let spb = self.splat16(b'\\');
+        let zero = self.iconst(0);
+        let one = self.iconst(1);
+
+        let cont = self.b.create_block(); // (close, esc)
+        self.b.append_block_param(cont, types::I64);
+        self.b.append_block_param(cont, types::I64);
+        let l = self.b.create_block(); // (c, esc)
+        self.b.append_block_param(l, types::I64);
+        self.b.append_block_param(l, types::I64);
+        let tail = self.b.create_block();
+        self.b.append_block_param(tail, types::I64);
+        self.b.append_block_param(tail, types::I64);
+        self.b.ins().jump(l, &[start.into(), zero.into()]);
+
+        self.b.switch_to_block(l);
+        let c = self.b.block_params(l)[0];
+        let esc = self.b.block_params(l)[1];
+        let c16 = self.b.ins().iadd_imm(c, 16);
+        let v16 = self.b.create_block();
+        let ge = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, c16, end);
+        self.b
+            .ins()
+            .brif(ge, v16, &[], tail, &[c.into(), esc.into()]);
+
+        self.b.switch_to_block(v16);
+        let v = self.b.ins().load(types::I8X16, MemFlags::new(), c, 0);
+        let eqq = self.b.ins().icmp(IntCC::Equal, v, spq);
+        let eqb = self.b.ins().icmp(IntCC::Equal, v, spb);
+        let m = self.b.ins().bor(eqq, eqb);
+        let bits = self.b.ins().vhigh_bits(types::I32, m);
+        let nz = self.b.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+        let hit = self.b.create_block();
+        let adv = self.b.create_block();
+        self.b.ins().brif(nz, hit, &[], adv, &[]);
+        self.b.switch_to_block(adv);
+        self.b.ins().jump(l, &[c16.into(), esc.into()]);
+
+        self.b.switch_to_block(hit);
+        let idx = self.b.ins().ctz(bits);
+        let idx = self.b.ins().uextend(types::I64, idx);
+        let pp = self.b.ins().iadd(c, idx);
+        let bb = self.load_u8(pp);
+        let is_q = self.byte_eq(bb, b'"');
+        let bs = self.b.create_block();
+        self.b
+            .ins()
+            .brif(is_q, cont, &[pp.into(), esc.into()], bs, &[]);
+        self.b.switch_to_block(bs);
+        let c2 = self.b.ins().iadd_imm(pp, 2); // past '\' + escaped byte
+        self.b.ins().jump(l, &[c2.into(), one.into()]);
+
+        // scalar tail
+        self.b.switch_to_block(tail);
+        let th = self.b.create_block();
+        self.b.append_block_param(th, types::I64);
+        self.b.append_block_param(th, types::I64);
+        let tc = self.b.block_params(tail)[0];
+        let te = self.b.block_params(tail)[1];
+        self.b.ins().jump(th, &[tc.into(), te.into()]);
+        self.b.switch_to_block(th);
+        let c = self.b.block_params(th)[0];
+        let esc = self.b.block_params(th)[1];
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, end);
+        let tb = self.b.create_block();
+        self.b.ins().brif(
+            inb,
+            tb,
+            &[],
+            cont,
+            &[c.into(), esc.into()],
+        );
+        self.b.switch_to_block(tb);
+        let b = self.load_u8(c);
+        let is_q = self.byte_eq(b, b'"');
+        let nb = self.b.create_block();
+        self.b
+            .ins()
+            .brif(is_q, cont, &[c.into(), esc.into()], nb, &[]);
+        self.b.switch_to_block(nb);
+        let is_bs = self.byte_eq(b, b'\\');
+        let c1 = self.b.ins().iadd_imm(c, 1);
+        let c2 = self.b.ins().iadd_imm(c, 2);
+        let cn = self.b.ins().select(is_bs, c2, c1);
+        let en = self.b.ins().select(is_bs, one, esc);
+        self.b.ins().jump(th, &[cn.into(), en.into()]);
+
+        self.b.switch_to_block(cont);
+        let close = self.b.block_params(cont)[0];
+        let esc = self.b.block_params(cont)[1];
+        let len = self.b.ins().isub(close, start);
+        let after = self.b.ins().iadd_imm(close, 1);
         (start, len, after, esc)
     }
 
@@ -1206,62 +1313,4 @@ unsafe extern "C" fn rt_unescape(
     let boxed = out.into_boxed_slice(); // exact-size alloc
     unsafe { *out_len = boxed.len() };
     Box::into_raw(boxed) as *mut u8
-}
-
-/// Whitespace skip, SIMD-friendly: advance past bytes <= 0x20 (covers
-/// space/\t/\n/\r; stray <0x20 controls can't validly appear between
-/// tokens — same leniency as before). `position` autovectorizes on NEON.
-unsafe extern "C" fn rt_wsskip(
-    cur: *const u8,
-    end: *const u8,
-) -> *const u8 {
-    let n = (end as usize).saturating_sub(cur as usize);
-    let s = unsafe { std::slice::from_raw_parts(cur, n) };
-    match s.iter().position(|&b| b > 0x20) {
-        Some(i) => unsafe { cur.add(i) },
-        None => end,
-    }
-}
-
-/// String span via `memchr2('"','\\')` (NEON). `q` points at the opening
-/// quote. Writes `out[0]=body_len`, `out[1]=had_escape`; returns the
-/// cursor just past the closing quote.
-unsafe extern "C" fn rt_strscan(
-    q: *const u8,
-    end: *const u8,
-    out: *mut u64,
-) -> *const u8 {
-    let s = unsafe { q.add(1) };
-    let mut i = s;
-    let mut esc = 0u64;
-    loop {
-        let n = (end as usize).saturating_sub(i as usize);
-        let hay = unsafe { std::slice::from_raw_parts(i, n) };
-        match memchr::memchr2(b'"', b'\\', hay) {
-            None => {
-                let len = (end as usize - s as usize) as u64;
-                unsafe {
-                    *out = len;
-                    *out.add(1) = esc;
-                }
-                return end;
-            }
-            Some(off) => {
-                let p = unsafe { i.add(off) };
-                if unsafe { *p } == b'"' {
-                    let len = (p as usize - s as usize) as u64;
-                    unsafe {
-                        *out = len;
-                        *out.add(1) = esc;
-                    }
-                    return unsafe { p.add(1) };
-                }
-                esc = 1;
-                i = unsafe { p.add(2) }; // skip '\' + escaped byte
-                if i > end {
-                    i = end;
-                }
-            }
-        }
-    }
 }
