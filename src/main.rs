@@ -122,6 +122,41 @@ fn main() {
     assert_eq!(bj, want(), "Box<T> round-trip (jit)");
     info!("🎉 box j:  {bj:?}  (Box<T> jit OK)");
 
+    // Recursive type round-trip (the new A3 capability): a cons-list
+    // where `Node` reaches itself through `Option<Box<Node>>`.
+    #[derive(Debug, PartialEq)]
+    struct Node {
+        val: u64,
+        next: Option<Box<Node>>,
+    }
+    let chain = || Node {
+        val: 1,
+        next: Some(Box::new(Node {
+            val: 2,
+            next: Some(Box::new(Node { val: 3, next: None })),
+        })),
+    };
+    const NJ: &str =
+        r#"{"val":1,"next":{"val":2,"next":{"val":3,"next":null}}}"#;
+
+    let mut ni: std::mem::MaybeUninit<Node> =
+        std::mem::MaybeUninit::uninit();
+    unsafe {
+        dwarf_json::from_json(NJ, &mut ni as *mut _ as *mut u8);
+    }
+    let ni = unsafe { ni.assume_init() };
+    assert_eq!(ni, chain(), "recursive type round-trip (interp)");
+    info!("🎉 rec i:  {ni:?}  (recursive interp OK)");
+
+    let mut nj: std::mem::MaybeUninit<Node> =
+        std::mem::MaybeUninit::uninit();
+    unsafe {
+        dwarf_json::from_json_jit_parse(NJ, &mut nj as *mut _ as *mut u8);
+    }
+    let nj = unsafe { nj.assume_init() };
+    assert_eq!(nj, chain(), "recursive type round-trip (jit)");
+    info!("🎉 rec j:  {nj:?}  (recursive jit OK)");
+
     // Profiling mode: print the JIT'd parser's code address and hammer it
     // forever so `stax` can sample + disassemble it.
     //   DWARF_JSON_PROFILE=1 cargo run --release

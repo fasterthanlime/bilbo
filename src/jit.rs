@@ -8,6 +8,7 @@
 //! (`rt_skip`).
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -17,7 +18,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 
-use crate::plan::{SeqLayout, Ty};
+use crate::plan::{RecCell, SeqLayout, Ty};
 
 /// `extern "C" fn(dst: *mut u8, input: *const u8, len: usize)` — parses raw
 /// JSON bytes straight into the struct, no `Json` tree at all.
@@ -103,28 +104,54 @@ impl Jit {
 
     fn compile_parser(&mut self, ty: &Ty) -> Parser {
         let p = types::I64;
-        let mut ctx = self.module.make_context();
-        ctx.func.signature.params.push(AbiParam::new(p)); // dst
-        ctx.func.signature.params.push(AbiParam::new(p)); // input ptr
-        ctx.func.signature.params.push(AbiParam::new(p)); // len
 
-        self.seq += 1;
-        let name = format!("parse_{}", self.seq);
-        let fid = self
-            .module
-            .declare_function(&name, Linkage::Local, &ctx.func.signature)
-            .unwrap();
+        // Recursive types can't be inlined forever, so each distinct
+        // [`RecCell`] becomes its own function `(dst, cur, end) -> cur`
+        // and `Ty::Ref` emits a call. Declared up front so the bodies can
+        // call each other (and recurse).
+        let mut cells: Vec<RecCell> = Vec::new();
+        collect_cells(ty, &mut HashSet::new(), &mut cells);
 
-        let mut fctx = FunctionBuilderContext::new();
-        {
+        let mut node_sig = self.module.make_signature();
+        for _ in 0..3 {
+            node_sig.params.push(AbiParam::new(p)); // dst, cur, end
+        }
+        node_sig.returns.push(AbiParam::new(p)); // new cur
+
+        let mut recs: HashMap<*const (), FuncId> = HashMap::new();
+        let mut rec_fns: Vec<(RecCell, FuncId, String)> = Vec::new();
+        for cell in &cells {
+            self.seq += 1;
+            let nm = format!("parse_rec_{}", self.seq);
+            let id = self
+                .module
+                .declare_function(&nm, Linkage::Local, &node_sig)
+                .unwrap();
+            recs.insert(cell.id(), id);
+            rec_fns.push((cell.clone(), id, nm));
+        }
+
+        // Sized-slot scratch + Emit boilerplate, shared by every function.
+        let emit_one = |module: &mut JITModule,
+                            shims: &Shims,
+                            recs: &HashMap<*const (), FuncId>,
+                            ctx: &mut cranelift_codegen::Context,
+                            body: &Ty,
+                            is_node: bool|
+         -> usize {
+            let mut fctx = FunctionBuilderContext::new();
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
             b.switch_to_block(entry);
             let dst = b.block_params(entry)[0];
-            let ptr = b.block_params(entry)[1];
-            let len = b.block_params(entry)[2];
-            let end = b.ins().iadd(ptr, len);
+            let (cur, end) = if is_node {
+                (b.block_params(entry)[1], b.block_params(entry)[2])
+            } else {
+                let ptr = b.block_params(entry)[1];
+                let len = b.block_params(entry)[2];
+                (ptr, b.ins().iadd(ptr, len))
+            };
             // 16-byte scratch for shims that return an extra value.
             let slot = b.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
@@ -132,31 +159,76 @@ impl Jit {
                 3,
             ));
             let sc = b.ins().stack_addr(types::I64, slot, 0);
-
             let mut e = Emit {
-                module: &mut self.module,
-                shims: &self.shims,
+                module,
+                shims,
+                recs,
                 b: &mut b,
             };
-            let p = Pctx { end, sc };
-            e.parse(ty, dst, ptr, &p);
-
-            b.ins().return_(&[]);
+            let pc = Pctx { end, sc };
+            let nc = e.parse(body, dst, cur, &pc);
+            if is_node {
+                b.ins().return_(&[nc]);
+            } else {
+                b.ins().return_(&[]);
+            }
             b.seal_all_blocks();
             b.finalize();
+            0
+        };
+
+        // Define every recursive node function.
+        let mut dumps: Vec<(String, FuncId, usize)> = Vec::new();
+        for (cell, fid, nm) in &rec_fns {
+            let mut ctx = self.module.make_context();
+            ctx.func.signature = node_sig.clone();
+            emit_one(
+                &mut self.module,
+                &self.shims,
+                &recs,
+                &mut ctx,
+                cell.get(),
+                true,
+            );
+            self.module.define_function(*fid, &mut ctx).unwrap();
+            let size = ctx
+                .compiled_code()
+                .map(|c| c.code_buffer().len())
+                .unwrap_or(0);
+            self.module.clear_context(&mut ctx);
+            dumps.push((nm.clone(), *fid, size));
         }
 
+        // Define the top-level parser `extern "C" fn(dst, ptr, len)`.
+        let mut ctx = self.module.make_context();
+        for _ in 0..3 {
+            ctx.func.signature.params.push(AbiParam::new(p));
+        }
+        self.seq += 1;
+        let name = format!("parse_{}", self.seq);
+        let fid = self
+            .module
+            .declare_function(&name, Linkage::Local, &ctx.func.signature)
+            .unwrap();
+        emit_one(
+            &mut self.module,
+            &self.shims,
+            &recs,
+            &mut ctx,
+            ty,
+            false,
+        );
         self.module.define_function(fid, &mut ctx).unwrap();
         let size = ctx
             .compiled_code()
             .map(|c| c.code_buffer().len())
             .unwrap_or(0);
         self.module.clear_context(&mut ctx);
+
+        // One finalize for the whole graph, then tell profilers about each
+        // function (finalized = relocated, so disassembly is honest).
         self.module.finalize_definitions().unwrap();
         let code = self.module.get_finalized_function(fid);
-
-        // Tell profilers what this anonymous JIT memory is. We dump the
-        // *finalized* (relocated) bytes so disassembly shows real targets.
         if size > 0 {
             let bytes = unsafe { std::slice::from_raw_parts(code, size) };
             crate::jitdump::register(
@@ -165,7 +237,49 @@ impl Jit {
                 bytes,
             );
         }
+        for (nm, id, sz) in dumps {
+            if sz == 0 {
+                continue;
+            }
+            let c = self.module.get_finalized_function(id);
+            let bytes = unsafe { std::slice::from_raw_parts(c, sz) };
+            crate::jitdump::register(
+                &format!("dwarf_json::jit::{nm}"),
+                c as u64,
+                bytes,
+            );
+        }
         unsafe { std::mem::transmute::<*const u8, Parser>(code) }
+    }
+}
+
+/// Walk `ty`, collecting every distinct [`RecCell`] (by pointer identity)
+/// reachable from it — including through the cells' own bodies.
+fn collect_cells(
+    ty: &Ty,
+    seen: &mut HashSet<*const ()>,
+    out: &mut Vec<RecCell>,
+) {
+    match ty {
+        Ty::Ref(cell) if seen.insert(cell.id()) => {
+            out.push(cell.clone());
+            collect_cells(cell.get(), seen, out);
+        }
+        Ty::Ref(_) => {}
+        Ty::Struct { fields, .. } | Ty::Tuple { fields } => {
+            for f in fields {
+                collect_cells(&f.ty, seen, out);
+            }
+        }
+        Ty::Vec { elem, .. } => collect_cells(elem, seen, out),
+        Ty::Boxed { inner, .. } | Ty::Opt { inner, .. } => {
+            collect_cells(inner, seen, out)
+        }
+        Ty::Map { key, val, .. } => {
+            collect_cells(key, seen, out);
+            collect_cells(val, seen, out);
+        }
+        _ => {}
     }
 }
 
@@ -181,6 +295,9 @@ struct Pctx {
 struct Emit<'a, 'b> {
     module: &'a mut JITModule,
     shims: &'a Shims,
+    /// `RecCell` identity -> the node function compiled for it; `Ty::Ref`
+    /// emits a call here instead of inlining (recursion can't be inlined).
+    recs: &'a HashMap<*const (), FuncId>,
     b: &'a mut FunctionBuilder<'b>,
 }
 
@@ -639,6 +756,15 @@ impl Emit<'_, '_> {
             } => self.parse_map(
                 key, *key_size, val, *val_size, *new_at, *insert, dst, cur, p,
             ),
+
+            // Recursive back-edge: call the function compiled for this
+            // cell, threading the cursor through (dst, cur, end) -> cur.
+            Ty::Ref(cell) => {
+                let fid = self.recs[&cell.id()];
+                let r = self.module.declare_func_in_func(fid, self.b.func);
+                let c = self.b.ins().call(r, &[dst, cur, p.end]);
+                self.b.inst_results(c)[0]
+            }
 
             Ty::Unknown(w) => panic!("jit parser: unknown type `{w}`"),
         }

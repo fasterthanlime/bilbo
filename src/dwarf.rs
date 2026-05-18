@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use gimli::{EndianSlice, RunTimeEndian};
 use object::{Object, ObjectSection};
@@ -421,23 +421,22 @@ fn strip(unit: &Unit, mut off: Off) -> Off {
 }
 
 thread_local! {
-    /// Stripped DIE offsets currently being classified, in DFS order. A
-    /// recursive type (`Status` reachable from its own `Box<Status>`)
-    /// re-enters `classify` with an ancestor's offset still on the stack;
-    /// that's our cycle signal. A2 only handles non-recursive `Box`, so on
-    /// a cycle we bail with `Ty::Unknown` (A3 will replace this with a
-    /// proper back-edge into the cached `Ty`).
-    static IN_FLIGHT: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// Stripped DIE offsets *currently being classified*, each mapped to a
+    /// freshly-minted [`RecCell`]. When the body of a type reaches the type
+    /// itself, `classify` re-enters with an ancestor's offset still present
+    /// — that's a cycle. We hand back `Ty::Ref(cell)` immediately, and once
+    /// the ancestor's body finishes we tie the knot via `cell.0.set(..)`.
+    static MEMO: std::cell::RefCell<HashMap<usize, crate::plan::RecCell>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
-/// Pops the in-flight stack on scope exit (push/pop are strictly LIFO
-/// because `classify` is a depth-first walk).
-struct PopGuard;
-impl Drop for PopGuard {
+/// Removes our in-flight memo entry on scope exit (insert/remove are
+/// strictly LIFO because `classify` is a depth-first walk).
+struct MemoGuard(usize);
+impl Drop for MemoGuard {
     fn drop(&mut self) {
-        IN_FLIGHT.with(|s| {
-            s.borrow_mut().pop();
+        MEMO.with(|m| {
+            m.borrow_mut().remove(&self.0);
         });
     }
 }
@@ -447,13 +446,8 @@ pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
     let t = tag(unit, off);
     let name = die_name(dwarf, unit, off).unwrap_or_default();
 
-    if IN_FLIGHT.with(|s| s.borrow().contains(&off.0)) {
-        return Ty::Unknown(format!("recursive {name}"));
-    }
-    IN_FLIGHT.with(|s| s.borrow_mut().push(off.0));
-    let _pop = PopGuard;
-
-    // Layout-transparent wrappers: same bytes as `T` at offset 0.
+    // Layout-transparent wrappers: same bytes as `T` at offset 0. They have
+    // no identity of their own, so they don't participate in the memo.
     if name.starts_with("MaybeUninit<")
         || name.starts_with("ManuallyDrop<")
         || name.starts_with("UnsafeCell<")
@@ -463,13 +457,32 @@ pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
         return classify(dwarf, unit, inner);
     }
 
-    match t {
+    // Cycle? An ancestor with this DIE offset is still being built — hand
+    // the back-edge its (not-yet-filled) cell.
+    if let Some(cell) = MEMO.with(|m| m.borrow().get(&off.0).cloned()) {
+        return Ty::Ref(cell);
+    }
+    let cell = crate::plan::RecCell::new();
+    MEMO.with(|m| {
+        m.borrow_mut().insert(off.0, cell.clone());
+    });
+    let _g = MemoGuard(off.0);
+
+    let body = match t {
         gimli::DW_TAG_base_type => base_type(unit, off, &name),
         gimli::DW_TAG_pointer_type => boxed(dwarf, unit, off, &name),
         gimli::DW_TAG_structure_type => structure(dwarf, unit, off, &name),
         gimli::DW_TAG_enumeration_type => Ty::Unknown(format!("enum {name}")),
         _ => Ty::Unknown(name),
+    };
+
+    // The local + the MEMO entry hold two `Arc`s; anything beyond that is a
+    // `Ty::Ref` the body handed out, i.e. this type really is recursive —
+    // tie the knot. Non-recursive types stay inline (cell is just dropped).
+    if Arc::strong_count(&cell.0) > 2 {
+        let _ = cell.0.set(body.clone());
     }
+    body
 }
 
 fn base_type(unit: &Unit, off: Off, name: &str) -> Ty {

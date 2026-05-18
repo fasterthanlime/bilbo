@@ -145,6 +145,10 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
             panic!("interp backend doesn't build maps; use the JIT parser")
         }
 
+        // A recursive back-edge: follow it. Recursion terminates because
+        // the JSON data does (the `Option`/`null` at the leaf).
+        Ty::Ref(cell) => unsafe { run(dst, cell.get(), val) },
+
         Ty::Unknown(what) => panic!("don't know how to write type `{what}`"),
     }
 }

@@ -3,6 +3,44 @@
 //! the exact `ptr`/`cap`/`len` offsets inside `String`/`Vec` (whose word
 //! order Rust does not promise — we learned it from DWARF, once).
 
+use std::sync::{Arc, OnceLock};
+
+/// A back-edge into a recursive type. While classifying a type whose body
+/// reaches itself (`Node::next: Option<Box<Node>>`), we hand the inner
+/// occurrence one of these *before* the body is finished, then `set()` it
+/// once the body is known — tying the knot. Cloning a [`Ty`] only clones
+/// the `Arc`, so a cyclic type is finite in memory yet unfolds at runtime
+/// exactly as far as the JSON data demands.
+#[derive(Clone)]
+pub struct RecCell(pub Arc<OnceLock<Ty>>);
+
+impl RecCell {
+    pub fn new() -> Self {
+        RecCell(Arc::new(OnceLock::new()))
+    }
+    /// The resolved body (panics if the knot was never tied).
+    pub fn get(&self) -> &Ty {
+        self.0.get().expect("recursive Ty cell not set")
+    }
+    /// Pointer identity, used to dedup cells (one JIT function per cell).
+    pub fn id(&self) -> *const () {
+        Arc::as_ptr(&self.0) as *const ()
+    }
+}
+
+impl Default for RecCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for RecCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never recurse through the cycle when printing.
+        write!(f, "Ref(..)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Ty {
     Bool,
@@ -76,6 +114,10 @@ pub enum Ty {
         new_at: u64,
         insert: u64,
     },
+    /// A back-edge to an enclosing recursive type (e.g. the `Node` inside
+    /// `Node::next: Option<Box<Node>>`). Dereference via [`RecCell::get`];
+    /// the JIT compiles one function per cell and emits a call here.
+    Ref(RecCell),
     Unknown(String),
 }
 
