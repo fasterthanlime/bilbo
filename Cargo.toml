@@ -2,6 +2,10 @@
 name = "dwarf_json"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Amos Wenger <hi@bearcove.eu>"]
+description = "A JSON deserializer that recovers the destination type at runtime from the program's own DWARF, then JIT-compiles a specialized parser."
+repository = "https://github.com/fasterthanlime/dwarf-json"
 
 [lib]
 name = "dwarf_json"
