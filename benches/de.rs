@@ -23,7 +23,9 @@ fn main() {
     divan::main();
 }
 
-/// Run `f` once to warm (discarded), then hand it to divan.
+/// Warm `f` once (discarded) so divan's Tune phase calibrates its
+/// sample size on steady-state timing, not a cold first sample (which
+/// makes Tune pick sample_size=1 -> 100 noisy single-iter samples).
 fn warmed<O>(bencher: Bencher, mut f: impl FnMut() -> O) {
     black_box(f());
     bencher.bench_local(f);
