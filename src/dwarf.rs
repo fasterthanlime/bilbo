@@ -1,64 +1,81 @@
-//! Everything that talks to our own debug info: loading the `.dSYM`, mapping
-//! a (de-ASLR'd) program counter to the subprogram it belongs to, finding
-//! *which local* a raw pointer aliases by evaluating DWARF locations against
-//! the caller's CFA, and turning a type DIE into a recursive [`Ty`].
+//! Everything that talks to our own debug info: loading the `.dSYM` *once*
+//! into a process-global [`Store`], mapping a (de-ASLR'd) program counter to
+//! the subprogram it belongs to, finding *which local* a raw pointer aliases
+//! by evaluating DWARF locations, and turning a type DIE into a [`Ty`].
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use gimli::{EndianSlice, RunTimeEndian};
 use object::{Object, ObjectSection};
 use tracing::{info, warn};
 
-pub type Reader<'a> = EndianSlice<'a, RunTimeEndian>;
-pub type Dwarf<'a> = gimli::Dwarf<Reader<'a>>;
-pub type Unit<'a> = gimli::Unit<Reader<'a>>;
+use crate::plan::{FieldTy, SeqLayout, Ty};
+
+pub type Reader = EndianSlice<'static, RunTimeEndian>;
+pub type Dwarf = gimli::Dwarf<Reader>;
+pub type Unit = gimli::Unit<Reader>;
 pub type Off = gimli::UnitOffset<usize>;
 
-/// Load our own DWARF and hand it to `f`. Everything that borrows the mapped
-/// file stays inside this scope, which sidesteps a self-referential struct.
-pub fn with<R>(f: impl FnOnce(&Dwarf, &[Unit]) -> R) -> R {
-    let path = dsym_path();
-    info!("reading our own DWARF from {}", path.display());
-    let file = std::fs::File::open(&path).expect("open dSYM");
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap dSYM");
-    let object = object::File::parse(&*mmap).expect("parse Mach-O");
-    let endian = if object.is_little_endian() {
-        RunTimeEndian::Little
-    } else {
-        RunTimeEndian::Big
-    };
+/// Our own parsed DWARF, alive for the rest of the process. Built once; the
+/// hot path never touches the filesystem again.
+pub struct Store {
+    pub dwarf: Dwarf,
+    pub units: Vec<Unit>,
+}
 
-    let mut sections: HashMap<String, Cow<[u8]>> = HashMap::new();
-    for section in object.sections() {
-        if let Ok(name) = section.name()
-            && let Ok(data) = section.uncompressed_data()
-        {
-            sections.insert(name.to_string(), data);
+static STORE: OnceLock<Store> = OnceLock::new();
+
+/// Parse our `.dSYM` once and keep it forever. The mapped file and the
+/// section buffers are intentionally leaked to `'static` — this is a
+/// process-lifetime cache, so there is nothing to free.
+pub fn store() -> &'static Store {
+    STORE.get_or_init(|| {
+        let path = dsym_path();
+        info!("reading our own DWARF from {} (once)", path.display());
+        let file = std::fs::File::open(&path).expect("open dSYM");
+        let mmap =
+            unsafe { memmap2::Mmap::map(&file) }.expect("mmap dSYM");
+        let bytes: &'static [u8] = Box::leak(Box::new(mmap));
+        let object = object::File::parse(bytes).expect("parse Mach-O");
+        let endian = if object.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+
+        let mut sections: HashMap<String, &'static [u8]> = HashMap::new();
+        for section in object.sections() {
+            if let Ok(name) = section.name()
+                && let Ok(data) = section.uncompressed_data()
+            {
+                let leaked: &'static [u8] =
+                    Box::leak(data.into_owned().into_boxed_slice());
+                sections.insert(name.to_string(), leaked);
+            }
         }
-    }
-    let load = |id: gimli::SectionId| -> Result<Reader, gimli::Error> {
-        let elf = id.name(); // ".debug_info"
-        let macho = format!("__{}", &elf[1..]); // "__debug_info"
-        let macho = macho.get(..16).unwrap_or(macho.as_str());
-        let data = sections
-            .get(elf)
-            .or_else(|| sections.get(macho))
-            .map(|c| c.as_ref())
-            .unwrap_or(&[][..]);
-        Ok(EndianSlice::new(data, endian))
-    };
-    let dwarf = gimli::Dwarf::load(load).expect("load DWARF");
+        let load = |id: gimli::SectionId| -> Result<Reader, gimli::Error> {
+            let elf = id.name(); // ".debug_info"
+            let macho = format!("__{}", &elf[1..]); // "__debug_info"
+            let macho = macho.get(..16).unwrap_or(macho.as_str());
+            let data = sections
+                .get(elf)
+                .or_else(|| sections.get(macho))
+                .copied()
+                .unwrap_or(&[][..]);
+            Ok(EndianSlice::new(data, endian))
+        };
+        let dwarf = gimli::Dwarf::load(load).expect("load DWARF");
 
-    let mut units = Vec::new();
-    let mut headers = dwarf.units();
-    while let Some(h) = headers.next().expect("unit header") {
-        units.push(dwarf.unit(h).expect("parse unit"));
-    }
-    info!("loaded {} compilation unit(s)", units.len());
-
-    f(&dwarf, &units)
+        let mut units = Vec::new();
+        let mut headers = dwarf.units();
+        while let Some(h) = headers.next().expect("unit header") {
+            units.push(dwarf.unit(h).expect("parse unit"));
+        }
+        info!("loaded {} compilation unit(s)", units.len());
+        Store { dwarf, units }
+    })
 }
 
 fn dsym_path() -> PathBuf {
@@ -93,16 +110,31 @@ fn child_offsets(unit: &Unit, parent: Option<Off>) -> Vec<Off> {
     kids
 }
 
+/// Inlined / specialized DIEs carry their name and type on an abstract
+/// instance pointed to by `DW_AT_abstract_origin` (or `DW_AT_specification`).
+fn origin(unit: &Unit, off: Off) -> Option<Off> {
+    let entry = unit.entry(off).ok()?;
+    let v = entry
+        .attr_value(gimli::DW_AT_abstract_origin)
+        .or_else(|| entry.attr_value(gimli::DW_AT_specification))?;
+    match v {
+        gimli::AttributeValue::UnitRef(o) => Some(o),
+        _ => None,
+    }
+}
+
 fn die_name(dwarf: &Dwarf, unit: &Unit, off: Off) -> Option<String> {
     let entry = unit.entry(off).ok()?;
-    let attr = entry.attr_value(gimli::DW_AT_name)?;
-    Some(
-        dwarf
-            .attr_string(unit, attr)
-            .ok()?
-            .to_string_lossy()
-            .into_owned(),
-    )
+    if let Some(attr) = entry.attr_value(gimli::DW_AT_name) {
+        return Some(
+            dwarf
+                .attr_string(unit, attr)
+                .ok()?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    die_name(dwarf, unit, origin(unit, off)?)
 }
 
 fn tag(unit: &Unit, off: Off) -> gimli::DwTag {
@@ -118,10 +150,13 @@ fn udata(unit: &Unit, off: Off, attr: gimli::DwAt) -> Option<u64> {
 }
 
 fn type_ref(unit: &Unit, off: Off) -> Option<Off> {
-    match unit.entry(off).ok()?.attr_value(gimli::DW_AT_type)? {
-        gimli::AttributeValue::UnitRef(o) => Some(o),
-        _ => None,
+    if let Some(gimli::AttributeValue::UnitRef(o)) =
+        unit.entry(off).ok()?.attr_value(gimli::DW_AT_type)
+    {
+        return Some(o);
     }
+    // An inlined variable's type lives on its abstract origin.
+    type_ref(unit, origin(unit, off)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -237,8 +272,8 @@ struct Regs {
 /// The walk that hunts for the local whose address equals `ptr`. Bundled
 /// into a struct so the recursion carries one `&mut self`, not eight args.
 struct Hunt<'a> {
-    dwarf: &'a Dwarf<'a>,
-    unit: &'a Unit<'a>,
+    dwarf: &'a Dwarf,
+    unit: &'a Unit,
     regs: Regs,
     pc: u64,
     ptr: u64,
@@ -252,7 +287,12 @@ impl Hunt<'_> {
         }
         for off in child_offsets(self.unit, Some(parent)) {
             let t = tag(self.unit, off);
-            if t == gimli::DW_TAG_lexical_block {
+            // Closures get inlined into their caller (e.g. criterion's
+            // measurement loop), so the local we want can be nested in a
+            // lexical block *or* an inlined subroutine.
+            if t == gimli::DW_TAG_lexical_block
+                || t == gimli::DW_TAG_inlined_subroutine
+            {
                 if let Some(hit) = self.scan(off, depth + 1) {
                     return Some(hit);
                 }
@@ -348,53 +388,8 @@ fn sleb128(b: &[u8]) -> (i64, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Recursive type model
+// Type DIE -> Ty
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub enum Ty {
-    Bool,
-    Char,
-    U(u8), // size in bytes
-    I(u8),
-    F32,
-    F64,
-    Struct {
-        name: String,
-        fields: Vec<FieldTy>,
-    },
-    /// `alloc::string::String` — UTF-8 bytes behind a `Vec<u8>`.
-    Str(SeqLayout),
-    /// `alloc::vec::Vec<T>`.
-    Vec {
-        elem: Box<Ty>,
-        elem_size: u64,
-        elem_align: u64,
-        seq: SeqLayout,
-    },
-    /// `&str` fat pointer.
-    StrRef {
-        ptr_off: usize,
-        len_off: usize,
-    },
-    Unknown(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct FieldTy {
-    pub name: String,
-    pub offset: usize,
-    pub ty: Ty,
-}
-
-/// Where the data pointer / capacity / length words sit inside a `Vec`-like
-/// value. Their *order* is not guaranteed by Rust — DWARF tells us exactly.
-#[derive(Debug, Clone, Copy)]
-pub struct SeqLayout {
-    pub ptr_off: usize,
-    pub cap_off: usize,
-    pub len_off: usize,
-}
 
 /// Follow typedef / const / volatile / restrict wrappers to the real type.
 fn strip(unit: &Unit, mut off: Off) -> Off {

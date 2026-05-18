@@ -1,20 +1,19 @@
-//! The recursive writer. Given a [`Ty`] recovered from DWARF, a [`Json`]
-//! value, and a destination pointer, it pokes correctly-laid-out bytes into
-//! raw memory — recursing into structs and rebuilding `String`/`Vec`/`&str`
-//! honestly (real allocations, three words written at the DWARF-discovered
-//! offsets, since Rust does not promise their order).
+//! The interpreter backend. Given a [`Ty`] (already recovered from DWARF and
+//! cached), a [`Json`] value, and a destination pointer, it pokes
+//! correctly-laid-out bytes into raw memory — recursing into structs and
+//! rebuilding `String`/`Vec`/`&str` honestly (real allocations, three words
+//! written at the DWARF-discovered offsets, since Rust doesn't promise their
+//! order). No DWARF, no file I/O: this is the hot path.
 
 use std::alloc::{Layout, alloc};
 
-use tracing::info;
-
-use crate::dwarf::{SeqLayout, Ty};
 use crate::json::Json;
+use crate::plan::{SeqLayout, Ty};
 
 /// # Safety
 /// `dst` must point to uninitialized memory laid out exactly as `ty`
 /// describes (it does: `ty` came from the DWARF for *this* destination).
-pub unsafe fn poke(dst: *mut u8, ty: &Ty, val: &Json) {
+pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
     match ty {
         Ty::Bool => unsafe { *dst = matches!(val, Json::Bool(true)) as u8 },
         Ty::Char => {
@@ -32,14 +31,12 @@ pub unsafe fn poke(dst: *mut u8, ty: &Ty, val: &Json) {
         },
         Ty::F64 => unsafe { write_bytes(dst, &val.as_f64().to_le_bytes()) },
 
-        Ty::Struct { name, fields, .. } => {
-            info!("poking struct `{name}` with {} field(s)", fields.len());
+        Ty::Struct { name, fields } => {
             for f in fields {
                 let fv = val.get(&f.name).unwrap_or_else(|| {
                     panic!("JSON missing key `{}` for `{name}`", f.name)
                 });
-                info!("  .{} @ +{} : {:?}", f.name, f.offset, f.ty);
-                unsafe { poke(dst.add(f.offset), &f.ty, fv) };
+                unsafe { run(dst.add(f.offset), &f.ty, fv) };
             }
         }
 
@@ -80,7 +77,7 @@ pub unsafe fn poke(dst: *mut u8, ty: &Ty, val: &Json) {
                 let p = unsafe { alloc(layout) };
                 assert!(!p.is_null(), "allocation failed");
                 for (i, item) in items.iter().enumerate() {
-                    unsafe { poke(p.add(i * esz), elem, item) };
+                    unsafe { run(p.add(i * esz), elem, item) };
                 }
                 p
             };
@@ -123,7 +120,5 @@ unsafe fn write_word(dst: *mut u8, v: u64) {
 }
 
 unsafe fn write_bytes(dst: *mut u8, bytes: &[u8]) {
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len())
-    };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
 }
