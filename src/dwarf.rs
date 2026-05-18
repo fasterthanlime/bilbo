@@ -203,6 +203,11 @@ pub fn subprogram_at(
 /// Walk the subprogram's locals (descending lexical blocks), evaluate each
 /// one's `DW_OP_fbreg` location against the caller's `cfa`, and return the
 /// `(name, type DIE)` of the variable whose address equals `ptr`.
+/// Debug helper: the `DW_AT_name` of a subprogram DIE.
+pub fn subprogram_name(dwarf: &Dwarf, unit: &Unit, sp: Off) -> String {
+    die_name(dwarf, unit, sp).unwrap_or_else(|| "<anon>".into())
+}
+
 pub fn local_at_address(
     dwarf: &Dwarf,
     unit: &Unit,
@@ -250,12 +255,16 @@ pub fn local_at_address(
         ptr,
         seen: Vec::new(),
         fallback: None,
+        mu: Vec::new(),
     };
     // Optimized code reuses stack slots: several locals can share `ptr`'s
     // address in disjoint live ranges. The API contract is that the caller
     // passes `&mut MaybeUninit<T>`, so prefer a `MaybeUninit<…>` local;
     // only fall back to another same-address local if none is found.
-    let found = hunt.scan(sp, 0).or_else(|| hunt.fallback.take());
+    let found = hunt
+        .scan(sp, 0)
+        .or_else(|| hunt.fallback.take())
+        .or_else(|| hunt.sole_maybe_uninit());
     if found.is_none() {
         warn!("no local matched ptr {ptr:#x}. locals seen:");
         for (n, expr, addr) in &hunt.seen {
@@ -285,6 +294,12 @@ struct Hunt<'a> {
     seen: Vec<(String, String, Option<u64>)>,
     /// First same-address local that isn't a `MaybeUninit<…>`.
     fallback: Option<(String, Off)>,
+    /// Every `MaybeUninit<…>` local in the frame, by `(var name, type
+    /// name, type DIE)` — even ones the optimizer left with no usable
+    /// location. If nothing address-matches but exactly one *type* of
+    /// `MaybeUninit` local exists, the API contract (`from_json` is
+    /// handed `&mut MaybeUninit<T>`) says that's our target.
+    mu: Vec<(String, String, Off)>,
 }
 
 impl Hunt<'_> {
@@ -312,29 +327,83 @@ impl Hunt<'_> {
             }
             let name =
                 die_name(self.dwarf, self.unit, off).unwrap_or_default();
-            let Some(expr) =
-                var_location(self.dwarf, self.unit, off, self.pc)
-            else {
-                continue;
-            };
-            let addr = eval_addr(&expr, self.regs);
-            self.seen.push((name.clone(), format!("{expr:02x?}"), addr));
-            if addr == Some(self.ptr) {
-                let Some(ty) = type_ref(self.unit, off) else {
-                    continue;
-                };
-                let tn =
-                    die_name(self.dwarf, self.unit, ty).unwrap_or_default();
-                if tn.starts_with("MaybeUninit<") {
-                    info!("local `{name}` : {tn} is at ptr; that's our target");
-                    return Some((name, ty));
+            let ty = type_ref(self.unit, off);
+            let tn = ty
+                .map(|t| {
+                    die_name(self.dwarf, self.unit, t).unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let is_mu = tn.starts_with("MaybeUninit<");
+
+            match var_location(self.dwarf, self.unit, off, self.pc) {
+                Some(expr) => {
+                    let addr = eval_addr(&expr, self.regs);
+                    self.seen.push((
+                        name.clone(),
+                        format!("{expr:02x?}"),
+                        addr,
+                    ));
+                    if addr == Some(self.ptr) {
+                        if let Some(ty) = ty {
+                            if is_mu {
+                                info!(
+                                    "local `{name}` : {tn} is at ptr; \
+                                     that's our target"
+                                );
+                                return Some((name, ty));
+                            }
+                            if self.fallback.is_none() {
+                                self.fallback = Some((name.clone(), ty));
+                            }
+                        }
+                    }
                 }
-                if self.fallback.is_none() {
-                    self.fallback = Some((name.clone(), ty));
+                // The optimizer can elide a local's storage entirely
+                // (e.g. a tiny fn that returns its `MaybeUninit<T>` by
+                // value: NRVO forwards the caller's sret slot, no local
+                // location is emitted). The *type* DIE survives, which
+                // is all we need.
+                None => {
+                    self.seen.push((
+                        name.clone(),
+                        "<no location>".into(),
+                        None,
+                    ));
+                }
+            }
+            if is_mu {
+                if let Some(ty) = ty {
+                    self.mu.push((name.clone(), tn, ty));
                 }
             }
         }
         None
+    }
+
+    /// Last resort when no local's *address* matched `ptr` (its storage
+    /// was optimized out). If the frame has exactly one *type* of
+    /// `MaybeUninit<…>` local, the API contract makes it unambiguous.
+    fn sole_maybe_uninit(&self) -> Option<(String, Off)> {
+        let distinct: std::collections::HashSet<&str> =
+            self.mu.iter().map(|(_, tn, _)| tn.as_str()).collect();
+        match distinct.len() {
+            1 => {
+                let (vn, tn, ty) = &self.mu[0];
+                warn!(
+                    "no address matched; the frame's only MaybeUninit \
+                     local is `{vn}` : {tn} — using it (API contract)"
+                );
+                Some((vn.clone(), *ty))
+            }
+            0 => None,
+            _ => {
+                warn!(
+                    "no address matched and >1 MaybeUninit types in \
+                     frame ({distinct:?}); refusing to guess"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -426,13 +495,16 @@ thread_local! {
     /// itself, `classify` re-enters with an ancestor's offset still present
     /// — that's a cycle. We hand back `Ty::Ref(cell)` immediately, and once
     /// the ancestor's body finishes we tie the knot via `cell.0.set(..)`.
-    static MEMO: std::cell::RefCell<HashMap<usize, crate::plan::RecCell>> =
-        std::cell::RefCell::new(HashMap::new());
+    static MEMO: std::cell::RefCell<
+        HashMap<(usize, usize), crate::plan::RecCell>,
+    > = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Removes our in-flight memo entry on scope exit (insert/remove are
-/// strictly LIFO because `classify` is a depth-first walk).
-struct MemoGuard(usize);
+/// strictly LIFO because `classify` is a depth-first walk). Keyed by
+/// `(unit index, DIE offset)` because, after stub→definition redirect,
+/// a single classify can span several CUs.
+struct MemoGuard((usize, usize));
 impl Drop for MemoGuard {
     fn drop(&mut self) {
         MEMO.with(|m| {
@@ -441,8 +513,167 @@ impl Drop for MemoGuard {
     }
 }
 
+struct IdxFrame {
+    depth: isize,
+    off: usize,
+    decl: bool,
+    name: Option<String>,
+    has_child: bool,
+}
+
+fn idx_close(
+    f: IdxFrame,
+    ui: usize,
+    map: &mut HashMap<String, (usize, usize)>,
+) {
+    if f.has_child && !f.decl {
+        if let Some(n) = f.name {
+            map.entry(n).or_insert((ui, f.off));
+        }
+    }
+}
+
+/// Every type is emitted in many CUs: the CU that needs its layout emits
+/// a *complete* DIE (members present); CUs that merely mention it emit a
+/// *declaration stub* (`DW_AT_declaration`, or simply no members). Which
+/// one a given caller's frame chains into is luck of the draw — and a
+/// stub makes `seq_layout`/`structure` fail ("could not locate
+/// ptr/cap/len"). So index every *complete* struct/union definition by
+/// name, exactly once, and redirect any stub we meet to it. Rust's
+/// monomorphized type names carry full generic args, so the name alone
+/// identifies the layout.
+fn def_index() -> &'static HashMap<String, (usize, usize)> {
+    static IDX: OnceLock<HashMap<String, (usize, usize)>> = OnceLock::new();
+    IDX.get_or_init(|| {
+        let st = store();
+        let mut map: HashMap<String, (usize, usize)> = HashMap::new();
+        for (ui, unit) in st.units.iter().enumerate() {
+            let mut cur = unit.entries();
+            let mut stack: Vec<IdxFrame> = Vec::new();
+            while let Some(entry) = cur.next_dfs().ok().flatten() {
+                // Drain everything off `entry` first; `cur.depth()` /
+                // `cur.offset()` need `cur` back (the `&Entry` borrows it).
+                let etag = entry.tag();
+                let is_su = matches!(
+                    etag,
+                    gimli::DW_TAG_structure_type
+                        | gimli::DW_TAG_union_type
+                );
+                let decl = matches!(
+                    entry.attr_value(gimli::DW_AT_declaration),
+                    Some(gimli::AttributeValue::Flag(true))
+                );
+                let name = if is_su {
+                    entry
+                        .attr_value(gimli::DW_AT_name)
+                        .and_then(|v| st.dwarf.attr_string(unit, v).ok())
+                        .map(|s| s.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+                let depth = cur.depth();
+                let off = cur.offset().0;
+                // Close every frame whose subtree we've now left.
+                loop {
+                    let pop = match stack.last() {
+                        Some(t) => depth <= t.depth,
+                        None => false,
+                    };
+                    if !pop {
+                        break;
+                    }
+                    let f = stack.pop().unwrap();
+                    idx_close(f, ui, &mut map);
+                }
+                if is_su {
+                    stack.push(IdxFrame {
+                        depth,
+                        off,
+                        decl,
+                        name,
+                        has_child: false,
+                    });
+                } else if matches!(
+                    etag,
+                    gimli::DW_TAG_member | gimli::DW_TAG_variant_part
+                ) {
+                    if let Some(top) = stack.last_mut() {
+                        if depth == top.depth + 1 {
+                            top.has_child = true;
+                        }
+                    }
+                }
+            }
+            while let Some(f) = stack.pop() {
+                idx_close(f, ui, &mut map);
+            }
+        }
+        info!(
+            "def index: {} complete struct/union definitions across {} CUs",
+            map.len(),
+            st.units.len()
+        );
+        map
+    })
+}
+
+fn unit_idx(unit: &Unit) -> usize {
+    store()
+        .units
+        .iter()
+        .position(|u| std::ptr::eq(u, unit))
+        .expect("unit comes from the global store")
+}
+
+/// A struct/union DIE we can't read a layout from: a `DW_AT_declaration`
+/// stub, or one with a real `byte_size` but no members.
+fn is_stub(unit: &Unit, off: Off) -> bool {
+    if !matches!(
+        tag(unit, off),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type
+    ) {
+        return false;
+    }
+    let decl = matches!(
+        unit.entry(off)
+            .ok()
+            .and_then(|e| e.attr_value(gimli::DW_AT_declaration)),
+        Some(gimli::AttributeValue::Flag(true))
+    );
+    if decl {
+        return true;
+    }
+    if udata(unit, off, gimli::DW_AT_byte_size).unwrap_or(0) == 0 {
+        return false; // genuine ZST / unit struct is complete
+    }
+    !child_offsets(unit, Some(off)).into_iter().any(|c| {
+        matches!(
+            tag(unit, c),
+            gimli::DW_TAG_member | gimli::DW_TAG_variant_part
+        )
+    })
+}
+
+/// If `(unit, off)` is a stub, swap in the complete definition (often in
+/// another CU). Returns the `(unit index, unit, off)` to use from here.
+fn def_site(unit: &Unit, off: Off) -> (usize, &'static Unit, Off) {
+    let st = store();
+    if is_stub(unit, off) {
+        if let Some(name) = die_name(&st.dwarf, unit, off) {
+            if let Some(&(ui, o)) = def_index().get(&name) {
+                return (ui, &st.units[ui], gimli::UnitOffset(o));
+            }
+        }
+    }
+    let ui = unit_idx(unit);
+    (ui, &st.units[ui], off)
+}
+
 pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
     let off = strip(unit, off);
+    // The local's type DIE (or any nested one) may be an incomplete stub
+    // in this CU — redirect to the complete definition before reading it.
+    let (ui, unit, off) = def_site(unit, off);
     let t = tag(unit, off);
     let name = die_name(dwarf, unit, off).unwrap_or_default();
 
@@ -457,16 +688,18 @@ pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
         return classify(dwarf, unit, inner);
     }
 
-    // Cycle? An ancestor with this DIE offset is still being built — hand
-    // the back-edge its (not-yet-filled) cell.
-    if let Some(cell) = MEMO.with(|m| m.borrow().get(&off.0).cloned()) {
+    // Cycle? An ancestor with this DIE is still being built — hand the
+    // back-edge its (not-yet-filled) cell. Keyed by `(unit, off)` since
+    // the redirect above can move us between CUs.
+    let key = (ui, off.0);
+    if let Some(cell) = MEMO.with(|m| m.borrow().get(&key).cloned()) {
         return Ty::Ref(cell);
     }
     let cell = crate::plan::RecCell::new();
     MEMO.with(|m| {
-        m.borrow_mut().insert(off.0, cell.clone());
+        m.borrow_mut().insert(key, cell.clone());
     });
-    let _g = MemoGuard(off.0);
+    let _g = MemoGuard(key);
 
     let body = match t {
         gimli::DW_TAG_base_type => base_type(unit, off, &name),
@@ -837,6 +1070,9 @@ fn walk_seq(
         return;
     }
     let off = strip(unit, off);
+    // `RawVec`/`RawVecInner`/`Unique`/… are often stubs in the CU we
+    // arrived from — follow each to its complete definition.
+    let (_ui, unit, off) = def_site(unit, off);
     match tag(unit, off) {
         gimli::DW_TAG_pointer_type
             if s.ptr_off == usize::MAX => {
