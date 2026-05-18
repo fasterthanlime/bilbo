@@ -928,6 +928,31 @@ impl Emit<'_, '_> {
         let cur = self.ws(cur, p);
         let cur = self.b.ins().iadd_imm(cur, 1); // past '{'
 
+        // Default every `Option` field to `None` up front: a key that's
+        // absent from the JSON then stays `None` (serde's behaviour), and
+        // a present key simply overwrites it. Non-`Option` absent keys
+        // remain the caller's problem (just like serde, which errors).
+        for f in fields {
+            if let Ty::Opt {
+                disc_off,
+                disc_size,
+                none_discr,
+                size,
+                ..
+            } = &f.ty
+            {
+                let off = self.iconst(f.offset as i64);
+                let fdst = self.b.ins().iadd(dst, off);
+                self.memset0(fdst, *size);
+                self.store_imm(
+                    fdst,
+                    *disc_off as i64,
+                    *none_discr,
+                    *disc_size,
+                );
+            }
+        }
+
         let header = self.b.create_block();
         self.b.append_block_param(header, types::I64);
         let cont = self.b.create_block();

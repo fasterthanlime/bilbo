@@ -33,10 +33,17 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
 
         Ty::Struct { name, fields } => {
             for f in fields {
-                let fv = val.get(&f.name).unwrap_or_else(|| {
-                    panic!("JSON missing key `{}` for `{name}`", f.name)
-                });
-                unsafe { run(dst.add(f.offset), &f.ty, fv) };
+                match val.get(&f.name) {
+                    Some(fv) => unsafe { run(dst.add(f.offset), &f.ty, fv) },
+                    // Absent key + `Option` field == `None` (serde treats
+                    // missing `Option` fields as `None`; we match it).
+                    None if matches!(f.ty, Ty::Opt { .. }) => unsafe {
+                        run(dst.add(f.offset), &f.ty, &Json::Null)
+                    },
+                    None => {
+                        panic!("JSON missing key `{}` for `{name}`", f.name)
+                    }
+                }
             }
         }
 
