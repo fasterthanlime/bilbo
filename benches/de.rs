@@ -63,6 +63,19 @@ fn bench(c: &mut Criterion) {
         })
     });
 
+    g.bench_function("dwarf_json_jit_parse", |b| {
+        b.iter(|| {
+            let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
+            unsafe {
+                dwarf_json::from_json_jit_parse(
+                    black_box(JSON),
+                    &mut e as *mut _ as *mut u8,
+                );
+                black_box(e.assume_init());
+            }
+        })
+    });
+
     // --- isolate where our time goes ---------------------------------
 
     g.bench_function("parse_only", |b| {

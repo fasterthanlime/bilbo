@@ -52,4 +52,19 @@ fn main() {
         "🎉 jit:    host={:?} port={} tags={:?}",
         j.host, j.port, j.tags
     );
+
+    // And the cranelift parser that eats raw bytes (no Json tree).
+    let mut k: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
+    // Safety: `k` is exactly the local `ptr` will be matched to.
+    unsafe {
+        dwarf_json::from_json_jit_parse(
+            r#"{ "host": "parse.jit", "port": 9001, "tags": ["raw","bytes","🥖"], }"#,
+            &mut k as *mut _ as *mut u8,
+        );
+    }
+    let k = unsafe { k.assume_init() };
+    info!(
+        "🎉 jitp:   host={:?} port={} tags={:?}",
+        k.host, k.port, k.tags
+    );
 }

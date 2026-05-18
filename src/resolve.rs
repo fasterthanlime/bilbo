@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::info;
 
-use crate::jit::Compiled;
+use crate::jit::{Compiled, Parser};
 use crate::plan::Ty;
 use crate::{dwarf, frame};
 
@@ -25,8 +25,10 @@ type TypeKey = (usize, usize); // (unit index, DIE offset)
 /// Everything the hot path needs for a given type, built once.
 pub struct Resolved {
     pub ty: Ty,
-    /// The cranelift-compiled binder, compiled lazily on first JIT use.
+    /// The cranelift tree-walking binder, compiled lazily on first use.
     pub jit: OnceLock<Compiled>,
+    /// The cranelift raw-bytes parser, compiled lazily on first use.
+    pub jit_parser: OnceLock<Parser>,
 }
 
 static L1: OnceLock<Mutex<HashMap<u64, TypeKey>>> = OnceLock::new();
@@ -72,6 +74,7 @@ pub fn resolved(raw: &frame::Raw, ptr: u64) -> Arc<Resolved> {
                 Arc::new(Resolved {
                     ty,
                     jit: OnceLock::new(),
+                    jit_parser: OnceLock::new(),
                 })
             })
             .clone()

@@ -73,3 +73,16 @@ pub unsafe fn from_json_jit(s: &str, ptr: *mut u8) {
     let value = json::parse(s);
     unsafe { f(ptr, &value as *const json::Json) };
 }
+
+/// The fastest path: a cranelift-compiled parser specialized to the type
+/// that walks the raw JSON bytes straight into the struct — no `Json` tree.
+///
+/// # Safety
+/// Same contract as [`from_json`].
+#[inline(never)]
+pub unsafe fn from_json_jit_parse(s: &str, ptr: *mut u8) {
+    let raw = frame::raw();
+    let r = resolve::resolved(&raw, ptr as u64);
+    let f = *r.jit_parser.get_or_init(|| jit::compile_parser(&r.ty));
+    unsafe { f(ptr, s.as_ptr(), s.len()) };
+}
