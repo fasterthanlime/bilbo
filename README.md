@@ -29,12 +29,13 @@ This is not a serious library. It is, however, faster than serde_json.
 
 | input | serde_json | dwarf-json | |
 |---|---|---|---|
-| small struct (`Endpoint`) | ~107 ns | **~89 ns** | ~1.2× |
-| `citm_catalog.json` (1.7 MB) | ~1.08 ms | **~768 µs** | ~1.4× |
-| `canada.json` (2.3 MB) | ~2.23 ms | **~1.33 ms** | ~1.7× |
+| `citm_catalog.json` (1.7 MB) | ~1.06 ms | **~845 µs** | ~1.25× |
+| `canada.json` (2.3 MB) | ~2.23 ms | **~1.34 ms** | ~1.7× |
+| `twitter.json` (632 KB) | ~397 µs | **~322 µs** | ~1.2× |
 
-Output is byte-for-byte identical to `serde_json` (citm, endpoint). On
-`canada` we're actually *more* correct: serde_json's default float
+Output is byte-for-byte identical to `serde_json` (citm, twitter —
+including twitter's recursive `retweeted_status`). On `canada` we're
+actually *more* correct: serde_json's default float
 parser is best-effort (~1 ULP off on some coordinates); ours
 (`fast-float2`) is correctly-rounded, so the gate is "structure exact +
 coords within serde's own error."
@@ -89,6 +90,7 @@ cargo run                 # the demo: reconstructs an Endpoint, narrates
 cargo bench --bench de    # small struct vs serde_json / facet-json
 cargo bench --bench citm  # citm_catalog.json
 cargo bench --bench canada
+cargo bench --bench twitter  # full fidelity: enums, Box, recursion
 ```
 
 Each bench asserts byte-for-byte equality with `serde_json` before
@@ -97,11 +99,13 @@ timing.
 ## Supported types
 
 Structs, tuples (positional arrays), `Vec<T>`, `String`, `&str`,
-`bool`, `char`, `u8..u64`/`i8..i64`, `f32`/`f64`, `()`, niche
-`Option<T>` (pointer-niche: `Option<String>`, `Option<Vec<_>>`, …),
-`BTreeMap<String, V>`, and arbitrary nesting/recursion of the above.
-General tagged enums and `Box<T>` are in progress (the twitter.json
-benchmark needs them).
+`bool`, `char`, `u8..u64`/`i8..i64`, `f32`/`f64`, `()`, `Option<T>`
+(both niche — `Option<String>`, `Option<Box<_>>` — and tagged —
+`Option<u64>`, `Option<bool>`), an absent struct key meaning `None`
+(serde's rule), `Box<T>`, `BTreeMap<String, V>`, and **recursive
+types** (`Status::retweeted_status: Option<Box<Status>>` ties the knot
+via `Arc<OnceLock<Ty>>`; the JIT emits one function per cycle). This is
+exactly what the full-fidelity `twitter.json` benchmark exercises.
 
 ## Caveats
 
