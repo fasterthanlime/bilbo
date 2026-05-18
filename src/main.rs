@@ -38,22 +38,7 @@ fn main() {
         e.host, e.port, e.tags
     );
 
-    // Same thing, but bound by cranelift-compiled code.
-    let mut j: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
-    // Safety: `j` is exactly the local `ptr` will be matched to.
-    unsafe {
-        dwarf_json::from_json_jit(
-            r#"{ "host": "jit.dev", "port": 8443, "tags": ["fast","🦞"], }"#,
-            &mut j as *mut _ as *mut u8,
-        );
-    }
-    let j = unsafe { j.assume_init() };
-    info!(
-        "🎉 jit:    host={:?} port={} tags={:?}",
-        j.host, j.port, j.tags
-    );
-
-    // And the cranelift parser that eats raw bytes (no Json tree).
+    // The cranelift parser that eats raw bytes (no Json tree).
     let mut k: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
     // Safety: `k` is exactly the local `ptr` will be matched to.
     unsafe {

@@ -50,19 +50,6 @@ fn bench(c: &mut Criterion) {
         })
     });
 
-    g.bench_function("dwarf_json_jit", |b| {
-        b.iter(|| {
-            let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
-            unsafe {
-                dwarf_json::from_json_jit(
-                    black_box(JSON),
-                    &mut e as *mut _ as *mut u8,
-                );
-                black_box(e.assume_init());
-            }
-        })
-    });
-
     g.bench_function("dwarf_json_jit_parse", |b| {
         b.iter(|| {
             let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
@@ -103,12 +90,20 @@ fn bench(c: &mut Criterion) {
             })
         });
 
-        let f = *r.jit.get_or_init(|| dwarf_json::jit::compile(&r.ty));
-        g.bench_function("bind_only_jit", |b| {
+        // The cranelift parser called *directly* — no per-call frame
+        // capture, no cache lookups. Apples-to-apples vs serde_json::from_str.
+        let pf = *r
+            .jit_parser
+            .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
+        g.bench_function("parser_pure", |b| {
             b.iter(|| {
                 let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
                 unsafe {
-                    f(&mut e as *mut _ as *mut u8, &parsed as *const _);
+                    pf(
+                        &mut e as *mut _ as *mut u8,
+                        black_box(JSON).as_ptr(),
+                        JSON.len(),
+                    );
                     black_box(e.assume_init());
                 }
             })
