@@ -135,9 +135,24 @@ impl Jit {
         }
 
         self.module.define_function(fid, &mut ctx).unwrap();
+        let size = ctx
+            .compiled_code()
+            .map(|c| c.code_buffer().len())
+            .unwrap_or(0);
         self.module.clear_context(&mut ctx);
         self.module.finalize_definitions().unwrap();
         let code = self.module.get_finalized_function(fid);
+
+        // Tell profilers what this anonymous JIT memory is. We dump the
+        // *finalized* (relocated) bytes so disassembly shows real targets.
+        if size > 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(code, size) };
+            crate::jitdump::register(
+                &format!("dwarf_json::jit::{name}"),
+                code as u64,
+                bytes,
+            );
+        }
         unsafe { std::mem::transmute::<*const u8, Parser>(code) }
     }
 }
@@ -184,8 +199,13 @@ impl Emit<'_, '_> {
         self.b.ins().iconst(types::I64, v)
     }
     fn load_u8(&mut self, addr: Value) -> Value {
-        let v = self.b.ins().load(types::I8, MemFlags::trusted(), addr, 0);
-        self.b.ins().uextend(types::I64, v)
+        // Single extending load: `ldrb` already zero-extends, so this is
+        // one instruction (vs `load I8` + `uextend`, which adds a `uxtb`
+        // in every hot scan loop).
+        self.b.ins().uload8(types::I64, MemFlags::trusted(), addr, 0)
+    }
+    fn load_u8_off(&mut self, addr: Value, off: i32) -> Value {
+        self.b.ins().uload8(types::I64, MemFlags::trusted(), addr, off)
     }
     fn scratch(&mut self, sc: Value, off: i32) -> Value {
         self.b.ins().load(types::I64, MemFlags::trusted(), sc, off)
@@ -229,13 +249,13 @@ impl Emit<'_, '_> {
         self.b.switch_to_block(chk);
         let c = self.b.block_params(chk)[0];
         let b = self.load_u8(c);
-        let e1 = self.byte_eq(b, b' ');
-        let e2 = self.byte_eq(b, b'\n');
-        let e3 = self.byte_eq(b, b'\t');
-        let e4 = self.byte_eq(b, b'\r');
-        let o12 = self.b.ins().bor(e1, e2);
-        let o34 = self.b.ins().bor(e3, e4);
-        let is_ws = self.b.ins().bor(o12, o34);
+        // JSON ws is 0x20, and 0x09..=0x0d. `(b - 9) <= 4` (unsigned)
+        // covers \t\n\v\f\r; \v\f can't legally appear between tokens, so
+        // skipping them too is harmless leniency and halves the test.
+        let is_space = self.byte_eq(b, b' ');
+        let d = self.b.ins().iadd_imm(b, -9);
+        let in_ctrl = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, d, 4);
+        let is_ws = self.b.ins().bor(is_space, in_ctrl);
         let c1 = self.b.ins().iadd_imm(c, 1);
         self.b
             .ins()
@@ -362,11 +382,7 @@ impl Emit<'_, '_> {
         let mut acc =
             self.b.ins().icmp_imm(IntCC::Equal, kl, name.len() as i64);
         for (i, &ch) in name.iter().enumerate() {
-            let byte =
-                self.b
-                    .ins()
-                    .load(types::I8, MemFlags::trusted(), kp, i as i32);
-            let byte = self.b.ins().uextend(types::I64, byte);
+            let byte = self.load_u8_off(kp, i as i32);
             let eqi = self.byte_eq(byte, ch);
             acc = self.b.ins().band(acc, eqi);
         }
@@ -480,22 +496,70 @@ impl Emit<'_, '_> {
         let after = self.b.create_block();
         self.b.append_block_param(after, types::I64);
 
-        for f in fields {
-            let cond = self.keyeq(kp, kl, f.name.as_bytes());
-            let then_b = self.b.create_block();
-            let else_b = self.b.create_block();
-            self.b.ins().brif(cond, then_b, &[], else_b, &[]);
+        // One then-block per field, reachable from both the fast and slow
+        // dispatch chains; and one skip block for an unknown key.
+        let then_blocks: Vec<_> =
+            fields.iter().map(|_| self.b.create_block()).collect();
+        let skip_b = self.b.create_block();
 
+        // Fast path: if the key has >=8 bytes of slack before EOF, load it
+        // as a single word and compare against the constant field names
+        // (serde-style) instead of re-reading it byte-by-byte per field.
+        let kp8 = self.b.ins().iadd_imm(kp, 8);
+        let can_word =
+            self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, kp8, p.end);
+        let fast_b = self.b.create_block();
+        let slow_b = self.b.create_block();
+        self.b.ins().brif(can_word, fast_b, &[], slow_b, &[]);
+
+        self.b.switch_to_block(fast_b);
+        let w = self.b.ins().load(types::I64, MemFlags::trusted(), kp, 0);
+        for (f, &then_b) in fields.iter().zip(&then_blocks) {
+            let name = f.name.as_bytes();
+            let cond = if name.len() <= 8 {
+                let mut wb = [0u8; 8];
+                wb[..name.len()].copy_from_slice(name);
+                let word = u64::from_le_bytes(wb) as i64;
+                let mask = if name.len() == 8 {
+                    -1i64
+                } else {
+                    ((1u64 << (8 * name.len())) - 1) as i64
+                };
+                let lc =
+                    self.b.ins().icmp_imm(IntCC::Equal, kl, name.len() as i64);
+                let wm = self.b.ins().band_imm(w, mask);
+                let we = self.b.ins().icmp_imm(IntCC::Equal, wm, word);
+                self.b.ins().band(lc, we)
+            } else {
+                self.keyeq(kp, kl, name)
+            };
+            let next = self.b.create_block();
+            self.b.ins().brif(cond, then_b, &[], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(skip_b, &[]);
+
+        // Slow path (key within 8 bytes of EOF): byte-wise compare.
+        self.b.switch_to_block(slow_b);
+        for (f, &then_b) in fields.iter().zip(&then_blocks) {
+            let cond = self.keyeq(kp, kl, f.name.as_bytes());
+            let next = self.b.create_block();
+            self.b.ins().brif(cond, then_b, &[], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(skip_b, &[]);
+
+        for (f, &then_b) in fields.iter().zip(&then_blocks) {
             self.b.switch_to_block(then_b);
             let off = self.iconst(f.offset as i64);
             let fdst = self.b.ins().iadd(dst, off);
             let cc = self.parse(&f.ty, fdst, c, p);
             self.b.ins().jump(after, &[cc.into()]);
-
-            self.b.switch_to_block(else_b);
         }
+
         // no field matched: skip the value (rare; never hit for a known
         // schema, but keeps us correct on extra keys like serde does).
+        self.b.switch_to_block(skip_b);
         let skipped = self.call2(self.shims.skip, c, p.end);
         self.b.ins().jump(after, &[skipped.into()]);
 

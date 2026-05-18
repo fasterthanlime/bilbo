@@ -16,6 +16,7 @@ pub mod plan;
 
 mod dwarf;
 mod frame;
+mod jitdump;
 mod resolve;
 
 use std::sync::Arc;

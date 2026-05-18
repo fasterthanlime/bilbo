@@ -52,4 +52,34 @@ fn main() {
         "🎉 jitp:   host={:?} port={} tags={:?}",
         k.host, k.port, k.tags
     );
+
+    // Profiling mode: print the JIT'd parser's code address and hammer it
+    // forever so `stax` can sample + disassemble it.
+    //   DWARF_JSON_PROFILE=1 cargo run --release
+    if std::env::var_os("DWARF_JSON_PROFILE").is_some() {
+        const J: &str =
+            r#"{"host":"rustweek.org","port":443,"tags":["conf","rust","crab"]}"#;
+        let mut warm: std::mem::MaybeUninit<Endpoint> =
+            std::mem::MaybeUninit::uninit();
+        let r = unsafe {
+            dwarf_json::resolve(&mut warm as *mut _ as *mut u8)
+        };
+        let f = *r
+            .jit_parser
+            .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
+        info!("PARSER @ {:#x}  (stax annotate that address)", f as usize);
+        loop {
+            let mut e: std::mem::MaybeUninit<Endpoint> =
+                std::mem::MaybeUninit::uninit();
+            unsafe {
+                f(
+                    &mut e as *mut _ as *mut u8,
+                    J.as_ptr(),
+                    J.len(),
+                );
+                let v = e.assume_init();
+                std::hint::black_box(&v);
+            }
+        }
+    }
 }
