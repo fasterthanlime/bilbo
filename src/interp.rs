@@ -93,6 +93,24 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
             unsafe { write_seq(dst, seq, base, n, n) };
         }
 
+        Ty::Boxed { inner, size, align } => {
+            // Allocate `T` on the heap (matching `Global`, so the
+            // reconstructed `Box`'s `Drop` frees it), parse into it, and
+            // store the 8-byte owning pointer.
+            let sz = *size as usize;
+            let al = (*align as usize).max(1);
+            let p = if sz == 0 {
+                std::ptr::without_provenance_mut(al)
+            } else {
+                let layout = Layout::from_size_align(sz, al).unwrap();
+                let p = unsafe { alloc(layout) };
+                assert!(!p.is_null(), "allocation failed");
+                p
+            };
+            unsafe { run(p, inner, val) };
+            unsafe { write_word(dst, p as u64) };
+        }
+
         Ty::Unit => { /* zero-sized: consume the JSON value, write nothing */
         }
 

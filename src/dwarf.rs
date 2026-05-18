@@ -420,10 +420,38 @@ fn strip(unit: &Unit, mut off: Off) -> Off {
     }
 }
 
+thread_local! {
+    /// Stripped DIE offsets currently being classified, in DFS order. A
+    /// recursive type (`Status` reachable from its own `Box<Status>`)
+    /// re-enters `classify` with an ancestor's offset still on the stack;
+    /// that's our cycle signal. A2 only handles non-recursive `Box`, so on
+    /// a cycle we bail with `Ty::Unknown` (A3 will replace this with a
+    /// proper back-edge into the cached `Ty`).
+    static IN_FLIGHT: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pops the in-flight stack on scope exit (push/pop are strictly LIFO
+/// because `classify` is a depth-first walk).
+struct PopGuard;
+impl Drop for PopGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
     let off = strip(unit, off);
     let t = tag(unit, off);
     let name = die_name(dwarf, unit, off).unwrap_or_default();
+
+    if IN_FLIGHT.with(|s| s.borrow().contains(&off.0)) {
+        return Ty::Unknown(format!("recursive {name}"));
+    }
+    IN_FLIGHT.with(|s| s.borrow_mut().push(off.0));
+    let _pop = PopGuard;
 
     // Layout-transparent wrappers: same bytes as `T` at offset 0.
     if name.starts_with("MaybeUninit<")
@@ -437,7 +465,7 @@ pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
 
     match t {
         gimli::DW_TAG_base_type => base_type(unit, off, &name),
-        gimli::DW_TAG_pointer_type => Ty::Unknown(format!("*{name}")),
+        gimli::DW_TAG_pointer_type => boxed(dwarf, unit, off, &name),
         gimli::DW_TAG_structure_type => structure(dwarf, unit, off, &name),
         gimli::DW_TAG_enumeration_type => Ty::Unknown(format!("enum {name}")),
         _ => Ty::Unknown(name),
@@ -466,6 +494,25 @@ fn base_type(unit: &Unit, off: Off, name: &str) -> Ty {
         gimli::DW_ATE_signed | gimli::DW_ATE_signed_char => Ty::I(size),
         gimli::DW_ATE_unsigned | gimli::DW_ATE_unsigned_char => Ty::U(size),
         _ => Ty::Unknown(name.to_string()),
+    }
+}
+
+/// `Box<T>` (and any `DW_TAG_pointer_type` we treat as owned): allocate a
+/// `T`, parse into it, store the 8-byte pointer. `size`/`align` come from
+/// the pointee DIE so the JIT can `alloc`/`dealloc` it correctly.
+fn boxed(dwarf: &Dwarf, unit: &Unit, off: Off, name: &str) -> Ty {
+    let Some(pointee) = type_ref(unit, off) else {
+        return Ty::Unknown(format!("*{name}"));
+    };
+    let inner = classify(dwarf, unit, pointee);
+    let pointee = strip(unit, pointee);
+    let size = udata(unit, pointee, gimli::DW_AT_byte_size).unwrap_or(0);
+    let align = udata(unit, pointee, gimli::DW_AT_alignment)
+        .unwrap_or_else(|| size.max(1).next_power_of_two());
+    Ty::Boxed {
+        inner: Box::new(inner),
+        size,
+        align,
     }
 }
 

@@ -37,6 +37,13 @@ pub enum Ty {
     },
     /// A zero-sized field (`()`): consume the JSON value, write nothing.
     Unit,
+    /// `Box<T>` — an owned heap pointer (DWARF: a pointer to `T`). Allocate
+    /// `T`, parse into it, store the pointer.
+    Boxed {
+        inner: Box<Ty>,
+        size: u64,
+        align: u64,
+    },
     /// An `Option<T>` (one data variant + one empty variant), covering
     /// both encodings DWARF emits:
     ///

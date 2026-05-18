@@ -80,6 +80,48 @@ fn main() {
     assert_eq!(o, want, "tagged Option<scalar> round-trip");
     info!("🎉 opt:    {o:?}  (tagged Option OK)");
 
+    // Box<T> round-trip (the new A2 capability): owned heap pointers,
+    // through both backends.
+    #[derive(Debug, PartialEq)]
+    struct Inner {
+        x: u32,
+        label: String,
+    }
+    #[derive(Debug, PartialEq)]
+    struct BoxDemo {
+        id: u64,
+        inner: Box<Inner>,
+        tail: Box<u32>,
+    }
+    let want = || BoxDemo {
+        id: 7,
+        inner: Box::new(Inner {
+            x: 99,
+            label: "deep".into(),
+        }),
+        tail: Box::new(1234),
+    };
+    const BJ: &str =
+        r#"{"id":7,"inner":{"x":99,"label":"deep"},"tail":1234}"#;
+
+    let mut bi: std::mem::MaybeUninit<BoxDemo> =
+        std::mem::MaybeUninit::uninit();
+    unsafe {
+        dwarf_json::from_json(BJ, &mut bi as *mut _ as *mut u8);
+    }
+    let bi = unsafe { bi.assume_init() };
+    assert_eq!(bi, want(), "Box<T> round-trip (interp)");
+    info!("🎉 box i:  {bi:?}  (Box<T> interp OK)");
+
+    let mut bj: std::mem::MaybeUninit<BoxDemo> =
+        std::mem::MaybeUninit::uninit();
+    unsafe {
+        dwarf_json::from_json_jit_parse(BJ, &mut bj as *mut _ as *mut u8);
+    }
+    let bj = unsafe { bj.assume_init() };
+    assert_eq!(bj, want(), "Box<T> round-trip (jit)");
+    info!("🎉 box j:  {bj:?}  (Box<T> jit OK)");
+
     // Profiling mode: print the JIT'd parser's code address and hammer it
     // forever so `stax` can sample + disassemble it.
     //   DWARF_JSON_PROFILE=1 cargo run --release

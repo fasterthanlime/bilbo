@@ -45,6 +45,7 @@ struct Jit {
 #[derive(Clone, Copy)]
 struct Shims {
     alloc: FuncId,   // allocate string bytes (copy is emitted inline)
+    box_alloc: FuncId, // allocate one Box<T> payload (size, align)
     realloc: FuncId, // grow a Vec buffer
     skip: FuncId,     // skip an unknown object value
     f64v: FuncId,     // parse a float
@@ -58,6 +59,7 @@ impl Jit {
         let mut b =
             JITBuilder::new(default_libcall_names()).expect("jit builder");
         b.symbol("rt_alloc", rt_alloc as *const u8);
+        b.symbol("rt_box_alloc", rt_box_alloc as *const u8);
         b.symbol("rt_realloc", rt_realloc as *const u8);
         b.symbol("rt_skip", rt_skip as *const u8);
         b.symbol("rt_f64v", rt_f64v as *const u8);
@@ -83,6 +85,7 @@ impl Jit {
         };
         let shims = Shims {
             alloc: decl(&mut module, "rt_alloc", &[p], Some(p)),
+            box_alloc: decl(&mut module, "rt_box_alloc", &[p, p], Some(p)),
             realloc: decl(&mut module, "rt_realloc", &[p, p, p, p], Some(p)),
             skip: decl(&mut module, "rt_skip", &[p, p], Some(p)),
             f64v: decl(&mut module, "rt_f64v", &[p, p, p], Some(p)),
@@ -575,6 +578,17 @@ impl Emit<'_, '_> {
                 seq,
             } => self.parse_vec(elem, *elem_size, *elem_align, seq, dst, cur, p),
 
+            Ty::Boxed { inner, size, align } => {
+                // Heap-allocate the pointee, parse into it, store the
+                // 8-byte owning pointer at `dst`.
+                let sz = self.iconst(*size as i64);
+                let al = self.iconst(*align as i64);
+                let bp = self.call2(self.shims.box_alloc, sz, al);
+                let after = self.parse(inner, bp, cur, p);
+                self.b.ins().store(MemFlags::trusted(), bp, dst, 0);
+                after
+            }
+
             // Zero-sized (`()`): skip the JSON value, write nothing.
             Ty::Unit => self.call2(self.shims.skip, cur, p.end),
 
@@ -1036,6 +1050,20 @@ unsafe extern "C" fn rt_alloc(n: usize) -> *mut u8 {
         return std::ptr::without_provenance_mut(1);
     }
     let layout = std::alloc::Layout::from_size_align(n, 1).unwrap();
+    let p = unsafe { std::alloc::alloc(layout) };
+    assert!(!p.is_null());
+    p
+}
+
+/// Allocate one `Box<T>` payload (`size`/`align` come from the pointee's
+/// DWARF). Matches `Global` so the reconstructed `Box`'s `Drop` frees it.
+/// A ZST `Box` is a dangling, aligned, non-null pointer (like `Box::new(())`).
+unsafe extern "C" fn rt_box_alloc(size: usize, align: usize) -> *mut u8 {
+    let align = align.max(1);
+    if size == 0 {
+        return std::ptr::without_provenance_mut(align);
+    }
+    let layout = std::alloc::Layout::from_size_align(size, align).unwrap();
     let p = unsafe { std::alloc::alloc(layout) };
     assert!(!p.is_null());
     p
