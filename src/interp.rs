@@ -70,7 +70,7 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
             let base = if n == 0 {
                 // Mirror `Vec::new()`: no allocation, dangling aligned ptr,
                 // cap 0 — so the eventual `Drop` does not try to free it.
-                ealign as *mut u8
+                std::ptr::without_provenance_mut(ealign)
             } else {
                 let layout =
                     Layout::from_size_align(esz * n, ealign).unwrap();
@@ -92,7 +92,7 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
 /// value's `Drop` frees it correctly with `cap == len`), copy, return ptr.
 fn alloc_copy(bytes: &[u8], align: usize) -> *mut u8 {
     if bytes.is_empty() {
-        return align.max(1) as *mut u8;
+        return std::ptr::without_provenance_mut(align.max(1));
     }
     let layout = Layout::from_size_align(bytes.len(), align).unwrap();
     let p = unsafe { alloc(layout) };

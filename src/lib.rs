@@ -9,6 +9,7 @@
 //!   [`json`] into memory using only that `Ty`. No file I/O, no DWARF.
 
 pub mod interp;
+pub mod jit;
 pub mod json;
 pub mod plan;
 
@@ -56,4 +57,18 @@ pub unsafe fn from_json(s: &str, ptr: *mut u8) {
     let ty = resolve::plan_for(&caller, ptr as u64);
     let value = json::parse(s);
     unsafe { interp::run(ptr, &ty, &value) };
+}
+
+/// Same pipeline, but the bind step is a cranelift-compiled function
+/// specialized to this call site's type (compiled once, then cached).
+///
+/// # Safety
+/// Same contract as [`from_json`].
+#[inline(never)]
+pub unsafe fn from_json_jit(s: &str, ptr: *mut u8) {
+    let caller = frame::caller();
+    let ty = resolve::plan_for(&caller, ptr as u64);
+    let f = jit::compiled(caller.static_pc, &ty);
+    let value = json::parse(s);
+    unsafe { f(ptr, &value as *const json::Json) };
 }

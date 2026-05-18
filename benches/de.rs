@@ -50,6 +50,58 @@ fn bench(c: &mut Criterion) {
         })
     });
 
+    g.bench_function("dwarf_json_jit", |b| {
+        b.iter(|| {
+            let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
+            unsafe {
+                dwarf_json::from_json_jit(
+                    black_box(JSON),
+                    &mut e as *mut _ as *mut u8,
+                );
+                black_box(e.assume_init());
+            }
+        })
+    });
+
+    // --- isolate where our time goes ---------------------------------
+
+    g.bench_function("parse_only", |b| {
+        b.iter(|| black_box(dwarf_json::json::parse(black_box(JSON))))
+    });
+
+    {
+        // Resolve + parse once; measure only the bind step.
+        let mut warm: MaybeUninit<Endpoint> = MaybeUninit::uninit();
+        let plan =
+            unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
+        let parsed = dwarf_json::json::parse(JSON);
+
+        g.bench_function("bind_only_interp", |b| {
+            b.iter(|| {
+                let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
+                unsafe {
+                    dwarf_json::interp::run(
+                        &mut e as *mut _ as *mut u8,
+                        &plan,
+                        &parsed,
+                    );
+                    black_box(e.assume_init());
+                }
+            })
+        });
+
+        let f = dwarf_json::jit::compiled(0xB17, &plan);
+        g.bench_function("bind_only_jit", |b| {
+            b.iter(|| {
+                let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
+                unsafe {
+                    f(&mut e as *mut _ as *mut u8, &parsed as *const _);
+                    black_box(e.assume_init());
+                }
+            })
+        });
+    }
+
     g.finish();
 }
 

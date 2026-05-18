@@ -34,8 +34,22 @@ fn main() {
     // Safety: yolo
     let e = unsafe { e.assume_init() };
     info!(
-        "🎉 reconstructed: host={:?} port={} tags={:?}",
+        "🎉 interp: host={:?} port={} tags={:?}",
         e.host, e.port, e.tags
     );
-    info!("   debug view: {e:#?}");
+
+    // Same thing, but bound by cranelift-compiled code.
+    let mut j: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
+    // Safety: `j` is exactly the local `ptr` will be matched to.
+    unsafe {
+        dwarf_json::from_json_jit(
+            r#"{ "host": "jit.dev", "port": 8443, "tags": ["fast","🦞"], }"#,
+            &mut j as *mut _ as *mut u8,
+        );
+    }
+    let j = unsafe { j.assume_init() };
+    info!(
+        "🎉 jit:    host={:?} port={} tags={:?}",
+        j.host, j.port, j.tags
+    );
 }
