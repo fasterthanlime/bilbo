@@ -1145,23 +1145,13 @@ unsafe extern "C" fn rt_f64v(
     sc: *mut u64,
 ) -> *const u8 {
     let cur = unsafe { rt_ws(cur, end) };
-    let mut q = cur;
-    while q < end {
-        let c = unsafe { *q };
-        if c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E')
-        {
-            q = unsafe { q.add(1) };
-        } else {
-            break;
-        }
-    }
-    let bytes = unsafe { slice(cur, q) };
-    let f: f64 = std::str::from_utf8(bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
+    let bytes = unsafe { slice(cur, end) };
+    // fast-float2: correctly-rounded Eisel-Lemire; `parse_partial` also
+    // finds the token end, so no separate scan + no utf8 check.
+    let (f, n): (f64, usize) =
+        fast_float2::parse_partial(bytes).unwrap_or((0.0, 0));
     unsafe { *sc = f.to_bits() };
-    q
+    unsafe { cur.add(n) }
 }
 
 /// Decode a JSON string body `src[0..len]` (between the quotes) into a

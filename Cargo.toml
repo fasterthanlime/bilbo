@@ -36,6 +36,7 @@ cranelift-codegen = "0.131.1"
 cranelift-frontend = "0.131.1"
 framehop = "0.16.0"
 memchr = "2.8.0"
+fast-float2 = "0.2.3"
 
 [dev-dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
