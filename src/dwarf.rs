@@ -249,8 +249,13 @@ pub fn local_at_address(
         pc,
         ptr,
         seen: Vec::new(),
+        fallback: None,
     };
-    let found = hunt.scan(sp, 0);
+    // Optimized code reuses stack slots: several locals can share `ptr`'s
+    // address in disjoint live ranges. The API contract is that the caller
+    // passes `&mut MaybeUninit<T>`, so prefer a `MaybeUninit<…>` local;
+    // only fall back to another same-address local if none is found.
+    let found = hunt.scan(sp, 0).or_else(|| hunt.fallback.take());
     if found.is_none() {
         warn!("no local matched ptr {ptr:#x}. locals seen:");
         for (n, expr, addr) in &hunt.seen {
@@ -278,6 +283,8 @@ struct Hunt<'a> {
     pc: u64,
     ptr: u64,
     seen: Vec<(String, String, Option<u64>)>,
+    /// First same-address local that isn't a `MaybeUninit<…>`.
+    fallback: Option<(String, Off)>,
 }
 
 impl Hunt<'_> {
@@ -313,12 +320,18 @@ impl Hunt<'_> {
             let addr = eval_addr(&expr, self.regs);
             self.seen.push((name.clone(), format!("{expr:02x?}"), addr));
             if addr == Some(self.ptr) {
-                let ty = type_ref(self.unit, off)?;
-                info!(
-                    "local `{name}` is at {:#x} == ptr; that's our target",
-                    self.ptr
-                );
-                return Some((name, ty));
+                let Some(ty) = type_ref(self.unit, off) else {
+                    continue;
+                };
+                let tn =
+                    die_name(self.dwarf, self.unit, ty).unwrap_or_default();
+                if tn.starts_with("MaybeUninit<") {
+                    info!("local `{name}` : {tn} is at ptr; that's our target");
+                    return Some((name, ty));
+                }
+                if self.fallback.is_none() {
+                    self.fallback = Some((name.clone(), ty));
+                }
             }
         }
         None
@@ -432,6 +445,9 @@ pub fn classify(dwarf: &Dwarf, unit: &Unit, off: Off) -> Ty {
 }
 
 fn base_type(unit: &Unit, off: Off, name: &str) -> Ty {
+    if name == "()" {
+        return Ty::Unit;
+    }
     let size = udata(unit, off, gimli::DW_AT_byte_size).unwrap_or(0) as u8;
     let enc = match unit
         .entry(off)
@@ -476,6 +492,43 @@ fn structure(dwarf: &Dwarf, unit: &Unit, off: Off, name: &str) -> Ty {
             seq: seq_layout(dwarf, unit, off),
         };
     }
+    if name.starts_with("BTreeMap<") {
+        // BTreeMap<String, V, Global> — key is always String here.
+        let k_off = template_named(dwarf, unit, off, "K")
+            .expect("BTreeMap<K,_> param");
+        let v_off = template_named(dwarf, unit, off, "V")
+            .expect("BTreeMap<_,V> param");
+        let v_name = die_name(dwarf, unit, v_off).unwrap_or_default();
+        let key = classify(dwarf, unit, k_off);
+        let key_size =
+            udata(unit, strip(unit, k_off), gimli::DW_AT_byte_size)
+                .unwrap_or(24);
+        let val = classify(dwarf, unit, v_off);
+        let val_size =
+            udata(unit, strip(unit, v_off), gimli::DW_AT_byte_size)
+                .unwrap_or(1);
+        let new_at = resolve_tramp("map_new_at", &v_name, false)
+            .unwrap_or_else(|| panic!("no map_new_at trampoline at all"));
+        let insert = resolve_tramp("map_insert", &v_name, true)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no map_insert trampoline for V=`{v_name}` \
+                     (call dwarf_json::tramp::force::<{v_name}>())"
+                )
+            });
+        return Ty::Map {
+            key: Box::new(key),
+            key_size,
+            val: Box::new(val),
+            val_size,
+            new_at,
+            insert,
+        };
+    }
+    // Niche-optimized enum (e.g. `Option<String>`): a `variant_part`.
+    if let Some(vp) = child_with_tag(unit, off, gimli::DW_TAG_variant_part) {
+        return niche_option(dwarf, unit, off, vp, name);
+    }
 
     // A plain aggregate: recurse into its members.
     let mut fields = Vec::new();
@@ -509,6 +562,158 @@ fn template_param(unit: &Unit, off: Off) -> Option<Off> {
         }
     }
     None
+}
+
+/// The `DW_TAG_template_type_parameter` named `want` (e.g. "V").
+fn template_named(
+    dwarf: &Dwarf,
+    unit: &Unit,
+    off: Off,
+    want: &str,
+) -> Option<Off> {
+    for c in child_offsets(unit, Some(off)) {
+        if tag(unit, c) == gimli::DW_TAG_template_type_parameter
+            && die_name(dwarf, unit, c).as_deref() == Some(want)
+        {
+            return type_ref(unit, c);
+        }
+    }
+    None
+}
+
+fn child_with_tag(unit: &Unit, off: Off, t: gimli::DwTag) -> Option<Off> {
+    child_offsets(unit, Some(off))
+        .into_iter()
+        .find(|&c| tag(unit, c) == t)
+}
+
+fn attr_udata(unit: &Unit, off: Off, at: gimli::DwAt) -> Option<u64> {
+    let e = unit.entry(off).ok()?;
+    e.attr(at)?.udata_value()
+}
+
+/// Find `crate::tramp::{fn_prefix}::<V>`'s runtime address: scan every
+/// unit for a subprogram whose name starts with `fn_prefix` and whose `V`
+/// template parameter resolves to a type named `v_name`. DWARF gives the
+/// link-time `DW_AT_low_pc`; add the ASLR slide to get something callable.
+/// Normalize a type name so the two spellings DWARF uses agree: the
+/// trampoline's monomorphized fn name has the fully-qualified value type
+/// (`alloc::string::String`), while a type DIE's name is the short form
+/// (`String`). Strip the module path on the head (before any `<`).
+fn norm_ty(s: &str) -> String {
+    let (head, rest) = match s.find('<') {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    };
+    let leaf = head.rsplit("::").next().unwrap_or(head);
+    format!("{leaf}{rest}")
+}
+
+fn resolve_tramp(
+    fn_prefix: &str,
+    v_name: &str,
+    match_v: bool,
+) -> Option<u64> {
+    let want = norm_ty(v_name);
+    let store = store();
+    for unit in &store.units {
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs().ok().flatten() {
+            if entry.tag() != gimli::DW_TAG_subprogram {
+                continue;
+            }
+            let off = entry.offset();
+            let name = die_name(&store.dwarf, unit, off).unwrap_or_default();
+            // e.g. "map_new_at<alloc::string::String>"
+            if !name.starts_with(fn_prefix) {
+                continue;
+            }
+            // `map_new_at::<V>` is V-independent (`BTreeMap::new()` is the
+            // same code for every V — ICF folds them into one symbol), so
+            // any instance is correct. `map_insert::<V>` is not: match V.
+            if match_v {
+                let Some(lt) = name.find('<') else { continue };
+                let inner = &name[lt + 1..name.len().saturating_sub(1)];
+                if norm_ty(inner) != want {
+                    continue;
+                }
+            }
+            if let Some(gimli::AttributeValue::Addr(lo)) =
+                unit.entry(off).ok()?.attr_value(gimli::DW_AT_low_pc)
+            {
+                return Some(lo + crate::frame::image_slide());
+            }
+        }
+    }
+    None
+}
+
+/// Parse a niche-optimized two-variant enum (`Option<T>`): one variant has
+/// a `DW_AT_discr_value` and an empty payload (`None`), the other has no
+/// discr value and a `__0: T` payload (`Some`). The discriminant overlaps
+/// the payload (no tag byte).
+fn niche_option(
+    dwarf: &Dwarf,
+    unit: &Unit,
+    off: Off,
+    vp: Off,
+    name: &str,
+) -> Ty {
+    let size = udata(unit, off, gimli::DW_AT_byte_size).unwrap_or(0);
+    let unk = || Ty::Unknown(format!("enum {name}"));
+
+    let Some(gimli::AttributeValue::UnitRef(disc_m)) = unit
+        .entry(vp)
+        .ok()
+        .and_then(|e| e.attr_value(gimli::DW_AT_discr))
+    else {
+        return unk();
+    };
+    let disc_off =
+        udata(unit, disc_m, gimli::DW_AT_data_member_location).unwrap_or(0)
+            as usize;
+    let disc_size = type_ref(unit, disc_m)
+        .map(|t| strip(unit, t))
+        .and_then(|t| udata(unit, t, gimli::DW_AT_byte_size))
+        .unwrap_or(8) as u8;
+
+    let mut none_val: Option<u128> = None;
+    let mut inner: Option<Ty> = None;
+    for v in child_offsets(unit, Some(vp)) {
+        if tag(unit, v) != gimli::DW_TAG_variant {
+            continue;
+        }
+        let dv = attr_udata(unit, v, gimli::DW_AT_discr_value);
+        let Some(pm) = child_with_tag(unit, v, gimli::DW_TAG_member) else {
+            continue;
+        };
+        let Some(pstruct) = type_ref(unit, pm) else { continue };
+        let pstruct = strip(unit, pstruct);
+        // payload field `__0`, if any
+        let f0 = child_offsets(unit, Some(pstruct)).into_iter().find(|&c| {
+            tag(unit, c) == gimli::DW_TAG_member
+                && die_name(dwarf, unit, c).as_deref() == Some("__0")
+        });
+        match (dv, f0) {
+            (Some(val), None) => none_val = Some(val as u128),
+            (_, Some(f0)) => {
+                if let Some(t) = type_ref(unit, f0) {
+                    inner = Some(classify(dwarf, unit, t));
+                }
+            }
+            _ => {}
+        }
+    }
+    match (none_val, inner) {
+        (Some(none_val), Some(inner)) => Ty::NicheOption {
+            disc_off,
+            disc_size,
+            none_val,
+            size,
+            inner: Box::new(inner),
+        },
+        _ => unk(),
+    }
 }
 
 /// Recursively flatten members of a `Vec`/`String` to locate the absolute

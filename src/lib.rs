@@ -13,6 +13,7 @@ pub mod interp;
 pub mod jit;
 pub mod json;
 pub mod plan;
+pub mod tramp;
 
 mod dwarf;
 mod frame;

@@ -84,6 +84,31 @@ pub unsafe fn run(dst: *mut u8, ty: &Ty, val: &Json) {
             unsafe { write_seq(dst, seq, base, n, n) };
         }
 
+        Ty::Unit => { /* zero-sized: consume the JSON value, write nothing */
+        }
+
+        Ty::NicheOption {
+            disc_off,
+            disc_size,
+            none_val,
+            size,
+            inner,
+        } => {
+            if matches!(val, Json::Null) {
+                unsafe { std::ptr::write_bytes(dst, 0, *size as usize) };
+                let nb = none_val.to_le_bytes();
+                unsafe {
+                    write_bytes(dst.add(*disc_off), &nb[..*disc_size as usize])
+                };
+            } else {
+                unsafe { run(dst, inner, val) };
+            }
+        }
+
+        Ty::Map { .. } => {
+            panic!("interp backend doesn't build maps; use the JIT parser")
+        }
+
         Ty::Unknown(what) => panic!("don't know how to write type `{what}`"),
     }
 }

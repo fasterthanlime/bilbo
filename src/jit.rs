@@ -46,8 +46,9 @@ struct Jit {
 struct Shims {
     alloc: FuncId,   // allocate string bytes (copy is emitted inline)
     realloc: FuncId, // grow a Vec buffer
-    skip: FuncId,    // skip an unknown object value
-    f64v: FuncId,    // parse a float
+    skip: FuncId,     // skip an unknown object value
+    f64v: FuncId,     // parse a float
+    unescape: FuncId, // decode a JSON string with escapes
 }
 
 impl Jit {
@@ -58,6 +59,7 @@ impl Jit {
         b.symbol("rt_realloc", rt_realloc as *const u8);
         b.symbol("rt_skip", rt_skip as *const u8);
         b.symbol("rt_f64v", rt_f64v as *const u8);
+        b.symbol("rt_unescape", rt_unescape as *const u8);
         let mut module = JITModule::new(b);
 
         let p = types::I64;
@@ -80,6 +82,7 @@ impl Jit {
             realloc: decl(&mut module, "rt_realloc", &[p, p, p, p], Some(p)),
             skip: decl(&mut module, "rt_skip", &[p, p], Some(p)),
             f64v: decl(&mut module, "rt_f64v", &[p, p, p], Some(p)),
+            unescape: decl(&mut module, "rt_unescape", &[p, p, p], Some(p)),
         };
 
         Jit {
@@ -354,43 +357,97 @@ impl Emit<'_, '_> {
         self.b.block_params(cont)[0]
     }
 
-    /// Inline string scan. Returns `(start_ptr, len, cursor_after_quote)`.
-    /// Skips leading ws; handles `\"` so we don't stop early (escapes are
-    /// not unescaped — naive fast path).
-    fn strspan(&mut self, cur: Value, p: &Pctx) -> (Value, Value, Value) {
+    /// Inline string scan. Returns `(start_ptr, len, cursor_after_quote,
+    /// had_escape)`. `\X` is skipped so we don't stop early; `had_escape`
+    /// (0/1) tells the caller whether a slow unescape pass is needed.
+    fn strspan(
+        &mut self,
+        cur: Value,
+        p: &Pctx,
+    ) -> (Value, Value, Value, Value) {
         let cur = self.ws(cur, p);
         let start = self.b.ins().iadd_imm(cur, 1); // past opening quote
+        let zero = self.iconst(0);
+        let one = self.iconst(1);
 
         let head = self.b.create_block();
-        self.b.append_block_param(head, types::I64);
+        self.b.append_block_param(head, types::I64); // q
+        self.b.append_block_param(head, types::I64); // esc
         let chk = self.b.create_block();
+        self.b.append_block_param(chk, types::I64);
         self.b.append_block_param(chk, types::I64);
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
-        self.b.ins().jump(head, &[start.into()]);
+        self.b.append_block_param(done, types::I64);
+        self.b.ins().jump(head, &[start.into(), zero.into()]);
 
         self.b.switch_to_block(head);
         let q = self.b.block_params(head)[0];
+        let esc = self.b.block_params(head)[1];
         let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, q, p.end);
-        self.b.ins().brif(inb, chk, &[q.into()], done, &[q.into()]);
+        self.b.ins().brif(
+            inb,
+            chk,
+            &[q.into(), esc.into()],
+            done,
+            &[q.into(), esc.into()],
+        );
 
         self.b.switch_to_block(chk);
         let q = self.b.block_params(chk)[0];
+        let esc = self.b.block_params(chk)[1];
         let b = self.load_u8(q);
         let is_quote = self.byte_eq(b, b'"');
         let is_bs = self.byte_eq(b, b'\\');
         let q1 = self.b.ins().iadd_imm(q, 1);
         let q2 = self.b.ins().iadd_imm(q, 2);
         let qn = self.b.ins().select(is_bs, q2, q1);
-        self.b
-            .ins()
-            .brif(is_quote, done, &[q.into()], head, &[qn.into()]);
+        let esc2 = self.b.ins().select(is_bs, one, esc);
+        self.b.ins().brif(
+            is_quote,
+            done,
+            &[q.into(), esc.into()],
+            head,
+            &[qn.into(), esc2.into()],
+        );
 
         self.b.switch_to_block(done);
         let qend = self.b.block_params(done)[0];
+        let esc = self.b.block_params(done)[1];
         let len = self.b.ins().isub(qend, start);
         let after = self.b.ins().iadd_imm(qend, 1);
-        (start, len, after)
+        (start, len, after, esc)
+    }
+
+    /// Build an owned string from `[sp, sp+sl)`: fast inline copy when there
+    /// were no escapes, else a Rust shim that unescapes (incl. `\uXXXX`).
+    /// Returns `(buf_ptr, byte_len)`.
+    fn build_str(
+        &mut self,
+        sp: Value,
+        sl: Value,
+        esc: Value,
+        p: &Pctx,
+    ) -> (Value, Value) {
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.append_block_param(cont, types::I64); // ptr
+        self.b.append_block_param(cont, types::I64); // len
+        self.b.ins().brif(esc, slow, &[], fast, &[]);
+
+        self.b.switch_to_block(fast);
+        let buf = self.call1(self.shims.alloc, sl);
+        self.emit_copy(buf, sp, sl);
+        self.b.ins().jump(cont, &[buf.into(), sl.into()]);
+
+        self.b.switch_to_block(slow);
+        let buf = self.call3(self.shims.unescape, sp, sl, p.sc);
+        let dl = self.scratch(p.sc, 0);
+        self.b.ins().jump(cont, &[buf.into(), dl.into()]);
+
+        self.b.switch_to_block(cont);
+        (self.b.block_params(cont)[0], self.b.block_params(cont)[1])
     }
 
     /// Inline integer scan. Returns `(value, cursor_after)`.
@@ -514,27 +571,25 @@ impl Emit<'_, '_> {
                 c
             }
             Ty::Char => {
-                let (sp, _sl, c) = self.strspan(cur, p);
+                let (sp, _sl, c, _e) = self.strspan(cur, p);
                 let ch = self.load_u8(sp);
                 let ch = self.b.ins().ireduce(types::I32, ch);
                 self.b.ins().store(MemFlags::trusted(), ch, dst, 0);
                 c
             }
             Ty::Str(seq) => {
-                let (sp, sl, c) = self.strspan(cur, p);
-                let buf = self.call1(self.shims.alloc, sl);
-                self.emit_copy(buf, sp, sl);
+                let (sp, sl, c, esc) = self.strspan(cur, p);
+                let (buf, blen) = self.build_str(sp, sl, esc, p);
                 self.store_at(dst, seq.ptr_off, buf);
-                self.store_at(dst, seq.cap_off, sl);
-                self.store_at(dst, seq.len_off, sl);
+                self.store_at(dst, seq.cap_off, blen);
+                self.store_at(dst, seq.len_off, blen);
                 c
             }
             Ty::StrRef { ptr_off, len_off } => {
-                let (sp, sl, c) = self.strspan(cur, p);
-                let buf = self.call1(self.shims.alloc, sl);
-                self.emit_copy(buf, sp, sl);
+                let (sp, sl, c, esc) = self.strspan(cur, p);
+                let (buf, blen) = self.build_str(sp, sl, esc, p);
                 self.store_at(dst, *ptr_off, buf);
-                self.store_at(dst, *len_off, sl);
+                self.store_at(dst, *len_off, blen);
                 c
             }
             Ty::Struct { fields, .. } => {
@@ -546,8 +601,175 @@ impl Emit<'_, '_> {
                 elem_align,
                 seq,
             } => self.parse_vec(elem, *elem_size, *elem_align, seq, dst, cur, p),
+
+            // Zero-sized (`()`): skip the JSON value, write nothing.
+            Ty::Unit => self.call2(self.shims.skip, cur, p.end),
+
+            Ty::NicheOption {
+                disc_off,
+                disc_size,
+                none_val,
+                size,
+                inner,
+            } => {
+                let c = self.ws(cur, p);
+                let b = self.load_u8(c);
+                let is_null = self.byte_eq(b, b'n');
+                let none_b = self.b.create_block();
+                let some_b = self.b.create_block();
+                let cont = self.b.create_block();
+                self.b.append_block_param(cont, types::I64);
+                self.b.ins().brif(is_null, none_b, &[], some_b, &[]);
+
+                self.b.switch_to_block(none_b);
+                self.memset0(dst, *size);
+                self.store_imm(dst, *disc_off as i64, *none_val, *disc_size);
+                let c4 = self.b.ins().iadd_imm(c, 4); // past "null"
+                self.b.ins().jump(cont, &[c4.into()]);
+
+                self.b.switch_to_block(some_b);
+                let cc = self.parse(inner, dst, c, p);
+                self.b.ins().jump(cont, &[cc.into()]);
+
+                self.b.switch_to_block(cont);
+                self.b.block_params(cont)[0]
+            }
+
+            Ty::Map {
+                key,
+                key_size,
+                val,
+                val_size,
+                new_at,
+                insert,
+            } => self.parse_map(
+                key, *key_size, val, *val_size, *new_at, *insert, dst, cur, p,
+            ),
+
             Ty::Unknown(w) => panic!("jit parser: unknown type `{w}`"),
         }
+    }
+
+    /// Zero `size` constant bytes at `dst` (unrolled).
+    fn memset0(&mut self, dst: Value, size: u64) {
+        let z = self.iconst(0);
+        let mut o = 0i32;
+        let mut rem = size;
+        while rem >= 8 {
+            self.b.ins().store(MemFlags::trusted(), z, dst, o);
+            o += 8;
+            rem -= 8;
+        }
+        for (w, t) in [(4u64, types::I32), (2, types::I16), (1, types::I8)] {
+            if rem >= w {
+                let zz = self.b.ins().ireduce(t, z);
+                self.b.ins().store(MemFlags::trusted(), zz, dst, o);
+                o += w as i32;
+                rem -= w;
+            }
+        }
+    }
+
+    /// Store a constant of `size` bytes at `dst + off`.
+    fn store_imm(&mut self, dst: Value, off: i64, val: u128, size: u8) {
+        let t = match size {
+            1 => types::I8,
+            2 => types::I16,
+            4 => types::I32,
+            _ => types::I64,
+        };
+        let v = self.b.ins().iconst(t, val as i64);
+        self.b.ins().store(MemFlags::trusted(), v, dst, off as i32);
+    }
+
+    /// `extern "C"` signature with `n` pointer args, no return.
+    fn void_sig(&mut self, n: usize) -> cranelift_codegen::ir::SigRef {
+        let mut s = self.module.make_signature();
+        for _ in 0..n {
+            s.params.push(AbiParam::new(types::I64));
+        }
+        self.b.import_signature(s)
+    }
+
+    /// Call an absolute address (a DWARF-resolved trampoline).
+    fn call_addr(
+        &mut self,
+        sig: cranelift_codegen::ir::SigRef,
+        addr: u64,
+        args: &[Value],
+    ) {
+        let a = self.b.ins().iconst(types::I64, addr as i64);
+        self.b.ins().call_indirect(sig, a, args);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_map(
+        &mut self,
+        key: &Ty,
+        key_size: u64,
+        val: &Ty,
+        val_size: u64,
+        new_at: u64,
+        insert: u64,
+        dst: Value,
+        cur: Value,
+        p: &Pctx,
+    ) -> Value {
+        // ctor: construct an empty BTreeMap in place at `dst`.
+        let sig1 = self.void_sig(1);
+        self.call_addr(sig1, new_at, &[dst]);
+        let sig3 = self.void_sig(3);
+
+        // Stack temps for one key / one value (moved into the map by insert).
+        let ks = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            key_size.max(1) as u32,
+            3,
+        ));
+        let vs = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            val_size.max(1) as u32,
+            3,
+        ));
+
+        let cur = self.ws(cur, p);
+        let cur = self.b.ins().iadd_imm(cur, 1); // past '{'
+        let header = self.b.create_block();
+        self.b.append_block_param(header, types::I64);
+        let cont = self.b.create_block();
+        self.b.append_block_param(cont, types::I64);
+        self.b.ins().jump(header, &[cur.into()]);
+
+        self.b.switch_to_block(header);
+        let hc = self.b.block_params(header)[0];
+        let hc = self.ws(hc, p);
+        let bch = self.load_u8(hc);
+        let is_end = self.byte_eq(bch, b'}');
+        let body = self.b.create_block();
+        self.b.append_block_param(body, types::I64);
+        let hc1 = self.b.ins().iadd_imm(hc, 1);
+        self.b
+            .ins()
+            .brif(is_end, cont, &[hc1.into()], body, &[hc.into()]);
+
+        self.b.switch_to_block(body);
+        let bc = self.b.block_params(body)[0];
+        let kaddr = self.b.ins().stack_addr(types::I64, ks, 0);
+        let vaddr = self.b.ins().stack_addr(types::I64, vs, 0);
+        let c = self.parse(key, kaddr, bc, p); // key (String)
+        let c = self.ws(c, p);
+        let c = self.b.ins().iadd_imm(c, 1); // past ':'
+        let c = self.parse(val, vaddr, c, p); // value
+        self.call_addr(sig3, insert, &[dst, kaddr, vaddr]);
+        let c = self.ws(c, p);
+        let bcm = self.load_u8(c);
+        let is_comma = self.byte_eq(bcm, b',');
+        let c1 = self.b.ins().iadd_imm(c, 1);
+        let c = self.b.ins().select(is_comma, c1, c);
+        self.b.ins().jump(header, &[c.into()]);
+
+        self.b.switch_to_block(cont);
+        self.b.block_params(cont)[0]
     }
 
     fn parse_struct(
@@ -580,7 +802,7 @@ impl Emit<'_, '_> {
 
         self.b.switch_to_block(body);
         let bc = self.b.block_params(body)[0];
-        let (kp, kl, mut c) = self.strspan(bc, p); // key
+        let (kp, kl, mut c, _e) = self.strspan(bc, p); // key
         c = self.ws(c, p);
         c = self.b.ins().iadd_imm(c, 1); // past ':'
 
@@ -942,4 +1164,75 @@ unsafe extern "C" fn rt_f64v(
         .unwrap_or(0.0);
     unsafe { *sc = f.to_bits() };
     q
+}
+
+/// Decode a JSON string body `src[0..len]` (between the quotes) into a
+/// freshly-allocated buffer, processing escapes including `\uXXXX` and
+/// surrogate pairs. Returns the buffer pointer; writes the decoded byte
+/// length to `*out_len`. Allocation size == decoded len, so the resulting
+/// `String { ptr, len, cap: len }` drops correctly.
+unsafe extern "C" fn rt_unescape(
+    src: *const u8,
+    len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let s = unsafe { std::slice::from_raw_parts(src, len) };
+    let mut out: Vec<u8> = Vec::with_capacity(len);
+    let mut i = 0;
+    let hex = |b: u8| -> u32 {
+        match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            _ => 0,
+        }
+    };
+    let u4 = |s: &[u8], i: usize| -> u32 {
+        hex(s[i]) << 12 | hex(s[i + 1]) << 8 | hex(s[i + 2]) << 4 | hex(s[i + 3])
+    };
+    while i < len {
+        let b = s[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= len {
+            break;
+        }
+        match s[i] {
+            b'"' => out.push(b'"'),
+            b'\\' => out.push(b'\\'),
+            b'/' => out.push(b'/'),
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'u' => {
+                let mut cp = u4(s, i + 1);
+                i += 4;
+                if (0xD800..=0xDBFF).contains(&cp)
+                    && i + 6 < len
+                    && s[i + 1] == b'\\'
+                    && s[i + 2] == b'u'
+                {
+                    let lo = u4(s, i + 3);
+                    if (0xDC00..=0xDFFF).contains(&lo) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;
+                    }
+                }
+                let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            other => out.push(other),
+        }
+        i += 1;
+    }
+    let boxed = out.into_boxed_slice(); // exact-size alloc
+    unsafe { *out_len = boxed.len() };
+    Box::into_raw(boxed) as *mut u8
 }

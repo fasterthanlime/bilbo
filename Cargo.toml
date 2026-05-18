@@ -46,3 +46,7 @@ facet-json = "0.46.1"
 [[bench]]
 name = "de"
 harness = false
+
+[[bench]]
+name = "citm"
+harness = false

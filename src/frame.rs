@@ -182,6 +182,12 @@ unsafe extern "C" {
     fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
 }
 
+/// The ASLR slide, so a DWARF `DW_AT_low_pc` (link-time) can be turned into
+/// the runtime address we can actually `bl` to from JIT'd code.
+pub(crate) fn image_slide() -> u64 {
+    main_image_slide()
+}
+
 fn main_image_slide() -> u64 {
     static SLIDE: OnceLock<u64> = OnceLock::new();
     *SLIDE.get_or_init(|| {

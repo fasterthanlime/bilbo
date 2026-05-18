@@ -29,6 +29,33 @@ pub enum Ty {
         ptr_off: usize,
         len_off: usize,
     },
+    /// A zero-sized field (`()`): consume the JSON value, write nothing.
+    Unit,
+    /// A niche-optimized `Option<T>` (e.g. `Option<String>`): no tag byte,
+    /// `None` is a sentinel value in a field that a valid `T` never has.
+    NicheOption {
+        /// Offset of the discriminant field within the option.
+        disc_off: usize,
+        /// Its size in bytes.
+        disc_size: u8,
+        /// The value the discriminant holds for `None`.
+        none_val: u128,
+        /// Total size of the option (== size of `T`); zeroed for `None`.
+        size: u64,
+        /// `Some`'s payload, laid out in place.
+        inner: Box<Ty>,
+    },
+    /// `BTreeMap<String, V>`. Built by calling the real std map via the
+    /// [`crate::tramp`] trampolines, resolved from DWARF.
+    Map {
+        key: Box<Ty>,
+        key_size: u64,
+        val: Box<Ty>,
+        val_size: u64,
+        /// Runtime addresses of `map_new_at::<V>` / `map_insert::<V>`.
+        new_at: u64,
+        insert: u64,
+    },
     Unknown(String),
 }
 
