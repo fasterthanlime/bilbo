@@ -44,7 +44,7 @@ struct Jit {
 /// scanning is emitted inline in cranelift; only these remain.
 #[derive(Clone, Copy)]
 struct Shims {
-    dup: FuncId,     // alloc + memcpy a string's bytes
+    alloc: FuncId,   // allocate string bytes (copy is emitted inline)
     realloc: FuncId, // grow a Vec buffer
     skip: FuncId,    // skip an unknown object value
     f64v: FuncId,    // parse a float
@@ -54,7 +54,7 @@ impl Jit {
     fn new() -> Self {
         let mut b =
             JITBuilder::new(default_libcall_names()).expect("jit builder");
-        b.symbol("rt_dup", rt_dup as *const u8);
+        b.symbol("rt_alloc", rt_alloc as *const u8);
         b.symbol("rt_realloc", rt_realloc as *const u8);
         b.symbol("rt_skip", rt_skip as *const u8);
         b.symbol("rt_f64v", rt_f64v as *const u8);
@@ -76,7 +76,7 @@ impl Jit {
             m.declare_function(name, Linkage::Import, &s).unwrap()
         };
         let shims = Shims {
-            dup: decl(&mut module, "rt_dup", &[p, p], Some(p)),
+            alloc: decl(&mut module, "rt_alloc", &[p], Some(p)),
             realloc: decl(&mut module, "rt_realloc", &[p, p, p, p], Some(p)),
             skip: decl(&mut module, "rt_skip", &[p, p], Some(p)),
             f64v: decl(&mut module, "rt_f64v", &[p, p, p], Some(p)),
@@ -173,6 +173,11 @@ struct Emit<'a, 'b> {
 }
 
 impl Emit<'_, '_> {
+    fn call1(&mut self, f: FuncId, a: Value) -> Value {
+        let r = self.module.declare_func_in_func(f, self.b.func);
+        let c = self.b.ins().call(r, &[a]);
+        self.b.inst_results(c)[0]
+    }
     fn call2(&mut self, f: FuncId, a: Value, b: Value) -> Value {
         let r = self.module.declare_func_in_func(f, self.b.func);
         let c = self.b.ins().call(r, &[a, b]);
@@ -229,6 +234,59 @@ impl Emit<'_, '_> {
             self.b.ins().ireduce(t, v)
         };
         self.b.ins().store(MemFlags::trusted(), v, dst, 0);
+    }
+
+    /// Inline `memcpy(dst, src, len)`: an 8-byte word loop then a byte
+    /// tail. No libc `memmove` call (which dominated short-string copies).
+    /// Leaves the builder on a fresh continuation block.
+    fn emit_copy(&mut self, dst: Value, src: Value, len: Value) {
+        let untrusted = MemFlags::new(); // src/dst may be unaligned
+        let wh = self.b.create_block();
+        self.b.append_block_param(wh, types::I64); // i
+        let wb = self.b.create_block();
+        self.b.append_block_param(wb, types::I64);
+        let bh = self.b.create_block();
+        self.b.append_block_param(bh, types::I64);
+        let bb = self.b.create_block();
+        self.b.append_block_param(bb, types::I64);
+        let done = self.b.create_block();
+
+        let zero = self.iconst(0);
+        self.b.ins().jump(wh, &[zero.into()]);
+
+        // word loop: while i + 8 <= len
+        self.b.switch_to_block(wh);
+        let i = self.b.block_params(wh)[0];
+        let i8 = self.b.ins().iadd_imm(i, 8);
+        let fits =
+            self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, i8, len);
+        self.b.ins().brif(fits, wb, &[i.into()], bh, &[i.into()]);
+
+        self.b.switch_to_block(wb);
+        let i = self.b.block_params(wb)[0];
+        let sa = self.b.ins().iadd(src, i);
+        let da = self.b.ins().iadd(dst, i);
+        let v = self.b.ins().load(types::I64, untrusted, sa, 0);
+        self.b.ins().store(untrusted, v, da, 0);
+        let i2 = self.b.ins().iadd_imm(i, 8);
+        self.b.ins().jump(wh, &[i2.into()]);
+
+        // byte tail: while i < len
+        self.b.switch_to_block(bh);
+        let i = self.b.block_params(bh)[0];
+        let lt = self.b.ins().icmp(IntCC::UnsignedLessThan, i, len);
+        self.b.ins().brif(lt, bb, &[i.into()], done, &[]);
+
+        self.b.switch_to_block(bb);
+        let i = self.b.block_params(bb)[0];
+        let sa = self.b.ins().iadd(src, i);
+        let da = self.b.ins().iadd(dst, i);
+        let v = self.b.ins().load(types::I8, untrusted, sa, 0);
+        self.b.ins().store(untrusted, v, da, 0);
+        let i2 = self.b.ins().iadd_imm(i, 1);
+        self.b.ins().jump(bh, &[i2.into()]);
+
+        self.b.switch_to_block(done);
     }
 
     /// Inline whitespace skip — `while cur < end && is_ws(*cur) { cur += 1 }`.
@@ -433,7 +491,8 @@ impl Emit<'_, '_> {
             }
             Ty::Str(seq) => {
                 let (sp, sl, c) = self.strspan(cur, p);
-                let buf = self.call2(self.shims.dup, sp, sl);
+                let buf = self.call1(self.shims.alloc, sl);
+                self.emit_copy(buf, sp, sl);
                 self.store_at(dst, seq.ptr_off, buf);
                 self.store_at(dst, seq.cap_off, sl);
                 self.store_at(dst, seq.len_off, sl);
@@ -441,7 +500,8 @@ impl Emit<'_, '_> {
             }
             Ty::StrRef { ptr_off, len_off } => {
                 let (sp, sl, c) = self.strspan(cur, p);
-                let buf = self.call2(self.shims.dup, sp, sl);
+                let buf = self.call1(self.shims.alloc, sl);
+                self.emit_copy(buf, sp, sl);
                 self.store_at(dst, *ptr_off, buf);
                 self.store_at(dst, *len_off, sl);
                 c
@@ -709,16 +769,16 @@ impl Emit<'_, '_> {
 
 // --- runtime shims -------------------------------------------------------
 
-/// Allocate + copy `n` bytes (matches `Global`, so `String`'s `Drop` frees
-/// it correctly with `cap == len`).
-unsafe extern "C" fn rt_dup(src: *const u8, n: usize) -> *mut u8 {
+/// Allocate `n` bytes (align 1, matches `Global` so `String`'s `Drop`
+/// frees it with `cap == len`). The copy is emitted inline by the JIT,
+/// so there's no libc `memmove` call per string.
+unsafe extern "C" fn rt_alloc(n: usize) -> *mut u8 {
     if n == 0 {
         return std::ptr::without_provenance_mut(1);
     }
     let layout = std::alloc::Layout::from_size_align(n, 1).unwrap();
     let p = unsafe { std::alloc::alloc(layout) };
     assert!(!p.is_null());
-    unsafe { std::ptr::copy_nonoverlapping(src, p, n) };
     p
 }
 
