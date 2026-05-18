@@ -106,6 +106,30 @@ fn serde_json(bencher: Bencher) {
     });
 }
 
+/// One ergonomic `from_json_jit_parse` call in a real `#[inline(never)]`
+/// frame, with the `MaybeUninit<T>` *used in place* — not returned by
+/// value (NRVO would forward the caller's sret slot and elide the local
+/// entirely, leaving no DIE; that's what the Box workaround was dodging).
+/// The cross-CU definition index handles any stub `String`/`Vec` types.
+#[inline(never)]
+fn ergonomic(j: &str) {
+    let mut e: MaybeUninit<Canada> = MaybeUninit::uninit();
+    let v = unsafe {
+        dwarf_json::from_json_jit_parse(j, &mut e as *mut _ as *mut u8);
+        e.assume_init()
+    };
+    black_box(&v);
+}
+
+/// Apples-to-apples vs `serde_json::from_str`: the ergonomic entry
+/// point. Every call pays frame capture + the two-level cache lookup
+/// (L1 hit: callsite -> type -> JIT'd parser), then runs that parser.
+#[divan::bench]
+#[inline(never)]
+fn dwarf_json(bencher: Bencher) {
+    warmed(bencher, || ergonomic(black_box(J)));
+}
+
 #[divan::bench]
 #[inline(never)]
 fn parser_pure(bencher: Bencher) {

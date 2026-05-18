@@ -50,7 +50,7 @@ pub fn resolved(raw: &frame::Raw, ptr: u64) -> Arc<Resolved> {
         dwarf::subprogram_at(&store.dwarf, &store.units, caller.static_pc)
             .expect("no subprogram for caller PC");
     let unit = &store.units[ui];
-    tracing::warn!(
+    tracing::info!(
         "caller pc {:#x} -> subprogram `{}`",
         caller.static_pc,
         dwarf::subprogram_name(&store.dwarf, unit, sp)
