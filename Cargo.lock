@@ -424,6 +424,7 @@ dependencies = [
  "facet-json",
  "framehop",
  "gimli",
+ "memchr",
  "memmap2",
  "object",
  "serde",

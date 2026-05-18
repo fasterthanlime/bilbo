@@ -49,6 +49,8 @@ struct Shims {
     skip: FuncId,     // skip an unknown object value
     f64v: FuncId,     // parse a float
     unescape: FuncId, // decode a JSON string with escapes
+    wsskip: FuncId,   // SIMD whitespace skip
+    strscan: FuncId,  // SIMD string-span (memchr2 '"' '\\')
 }
 
 impl Jit {
@@ -60,6 +62,8 @@ impl Jit {
         b.symbol("rt_skip", rt_skip as *const u8);
         b.symbol("rt_f64v", rt_f64v as *const u8);
         b.symbol("rt_unescape", rt_unescape as *const u8);
+        b.symbol("rt_wsskip", rt_wsskip as *const u8);
+        b.symbol("rt_strscan", rt_strscan as *const u8);
         let mut module = JITModule::new(b);
 
         let p = types::I64;
@@ -83,6 +87,8 @@ impl Jit {
             skip: decl(&mut module, "rt_skip", &[p, p], Some(p)),
             f64v: decl(&mut module, "rt_f64v", &[p, p, p], Some(p)),
             unescape: decl(&mut module, "rt_unescape", &[p, p, p], Some(p)),
+            wsskip: decl(&mut module, "rt_wsskip", &[p, p], Some(p)),
+            strscan: decl(&mut module, "rt_strscan", &[p, p, p], Some(p)),
         };
 
         Jit {
@@ -323,99 +329,64 @@ impl Emit<'_, '_> {
         self.b.switch_to_block(done);
     }
 
-    /// Inline whitespace skip — `while cur < end && is_ws(*cur) { cur += 1 }`.
+    /// Whitespace skip, hybrid: peel the first two bytes inline (covers the
+    /// common "no whitespace" and "one space after `:`" cases with zero
+    /// calls — this is what compact JSON like Endpoint hits), and only call
+    /// the SIMD shim for a genuine run (pretty-printed indentation).
     fn ws(&mut self, cur: Value, p: &Pctx) -> Value {
-        let head = self.b.create_block();
-        self.b.append_block_param(head, types::I64);
-        let chk = self.b.create_block();
-        self.b.append_block_param(chk, types::I64);
         let cont = self.b.create_block();
         self.b.append_block_param(cont, types::I64);
-        self.b.ins().jump(head, &[cur.into()]);
+        let b1 = self.b.create_block();
+        self.b.append_block_param(b1, types::I64);
+        let slow = self.b.create_block();
+        self.b.append_block_param(slow, types::I64);
 
-        self.b.switch_to_block(head);
-        let c = self.b.block_params(head)[0];
-        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, p.end);
-        self.b.ins().brif(inb, chk, &[c.into()], cont, &[c.into()]);
-
-        self.b.switch_to_block(chk);
-        let c = self.b.block_params(chk)[0];
-        let b = self.load_u8(c);
-        // JSON ws is 0x20, and 0x09..=0x0d. `(b - 9) <= 4` (unsigned)
-        // covers \t\n\v\f\r; \v\f can't legally appear between tokens, so
-        // skipping them too is harmless leniency and halves the test.
-        let is_space = self.byte_eq(b, b' ');
-        let d = self.b.ins().iadd_imm(b, -9);
-        let in_ctrl = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, d, 4);
-        let is_ws = self.b.ins().bor(is_space, in_ctrl);
-        let c1 = self.b.ins().iadd_imm(c, 1);
-        self.b
-            .ins()
-            .brif(is_ws, head, &[c1.into()], cont, &[c.into()]);
+        self.peel_ws(cur, p.end, cont, b1); // byte 0
+        self.b.switch_to_block(b1);
+        let c = self.b.block_params(b1)[0];
+        self.peel_ws(c, p.end, cont, slow); // byte 1
+        self.b.switch_to_block(slow);
+        let c = self.b.block_params(slow)[0];
+        let r = self.call2(self.shims.wsskip, c, p.end);
+        self.b.ins().jump(cont, &[r.into()]);
 
         self.b.switch_to_block(cont);
         self.b.block_params(cont)[0]
     }
 
-    /// Inline string scan. Returns `(start_ptr, len, cursor_after_quote,
-    /// had_escape)`. `\X` is skipped so we don't stop early; `had_escape`
-    /// (0/1) tells the caller whether a slow unescape pass is needed.
+    /// One inline whitespace byte: if `*c <= 0x20`, branch to `tail(c+1)`;
+    /// otherwise (or out of bounds) branch to `cont(c)`.
+    fn peel_ws(
+        &mut self,
+        c: Value,
+        end: Value,
+        cont: cranelift_codegen::ir::Block,
+        tail: cranelift_codegen::ir::Block,
+    ) {
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, c, end);
+        let bchk = self.b.create_block();
+        self.b.ins().brif(inb, bchk, &[], cont, &[c.into()]);
+        self.b.switch_to_block(bchk);
+        let v = self.load_u8(c);
+        let is_ws =
+            self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, v, 0x20);
+        let c1 = self.b.ins().iadd_imm(c, 1);
+        self.b.ins().brif(is_ws, tail, &[c1.into()], cont, &[c.into()]);
+    }
+
+    /// String scan via `memchr2('"','\\')`. Returns `(start, len,
+    /// cursor_after_quote, had_escape)`. Skips leading ws first.
     fn strspan(
         &mut self,
         cur: Value,
         p: &Pctx,
     ) -> (Value, Value, Value, Value) {
-        let cur = self.ws(cur, p);
-        let start = self.b.ins().iadd_imm(cur, 1); // past opening quote
-        let zero = self.iconst(0);
-        let one = self.iconst(1);
-
-        let head = self.b.create_block();
-        self.b.append_block_param(head, types::I64); // q
-        self.b.append_block_param(head, types::I64); // esc
-        let chk = self.b.create_block();
-        self.b.append_block_param(chk, types::I64);
-        self.b.append_block_param(chk, types::I64);
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.b.append_block_param(done, types::I64);
-        self.b.ins().jump(head, &[start.into(), zero.into()]);
-
-        self.b.switch_to_block(head);
-        let q = self.b.block_params(head)[0];
-        let esc = self.b.block_params(head)[1];
-        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, q, p.end);
-        self.b.ins().brif(
-            inb,
-            chk,
-            &[q.into(), esc.into()],
-            done,
-            &[q.into(), esc.into()],
-        );
-
-        self.b.switch_to_block(chk);
-        let q = self.b.block_params(chk)[0];
-        let esc = self.b.block_params(chk)[1];
-        let b = self.load_u8(q);
-        let is_quote = self.byte_eq(b, b'"');
-        let is_bs = self.byte_eq(b, b'\\');
-        let q1 = self.b.ins().iadd_imm(q, 1);
-        let q2 = self.b.ins().iadd_imm(q, 2);
-        let qn = self.b.ins().select(is_bs, q2, q1);
-        let esc2 = self.b.ins().select(is_bs, one, esc);
-        self.b.ins().brif(
-            is_quote,
-            done,
-            &[q.into(), esc.into()],
-            head,
-            &[qn.into(), esc2.into()],
-        );
-
-        self.b.switch_to_block(done);
-        let qend = self.b.block_params(done)[0];
-        let esc = self.b.block_params(done)[1];
-        let len = self.b.ins().isub(qend, start);
-        let after = self.b.ins().iadd_imm(qend, 1);
+        let q = self.ws(cur, p); // at the opening quote
+        let start = self.b.ins().iadd_imm(q, 1);
+        // rt_strscan(q, end, sc) -> after; sc[0]=len, sc[1]=esc
+        let after = self.call3(self.shims.strscan, q, p.end, p.sc);
+        let len = self.scratch(p.sc, 0);
+        let esc = self.scratch(p.sc, 8);
         (start, len, after, esc)
     }
 
@@ -1235,4 +1206,62 @@ unsafe extern "C" fn rt_unescape(
     let boxed = out.into_boxed_slice(); // exact-size alloc
     unsafe { *out_len = boxed.len() };
     Box::into_raw(boxed) as *mut u8
+}
+
+/// Whitespace skip, SIMD-friendly: advance past bytes <= 0x20 (covers
+/// space/\t/\n/\r; stray <0x20 controls can't validly appear between
+/// tokens — same leniency as before). `position` autovectorizes on NEON.
+unsafe extern "C" fn rt_wsskip(
+    cur: *const u8,
+    end: *const u8,
+) -> *const u8 {
+    let n = (end as usize).saturating_sub(cur as usize);
+    let s = unsafe { std::slice::from_raw_parts(cur, n) };
+    match s.iter().position(|&b| b > 0x20) {
+        Some(i) => unsafe { cur.add(i) },
+        None => end,
+    }
+}
+
+/// String span via `memchr2('"','\\')` (NEON). `q` points at the opening
+/// quote. Writes `out[0]=body_len`, `out[1]=had_escape`; returns the
+/// cursor just past the closing quote.
+unsafe extern "C" fn rt_strscan(
+    q: *const u8,
+    end: *const u8,
+    out: *mut u64,
+) -> *const u8 {
+    let s = unsafe { q.add(1) };
+    let mut i = s;
+    let mut esc = 0u64;
+    loop {
+        let n = (end as usize).saturating_sub(i as usize);
+        let hay = unsafe { std::slice::from_raw_parts(i, n) };
+        match memchr::memchr2(b'"', b'\\', hay) {
+            None => {
+                let len = (end as usize - s as usize) as u64;
+                unsafe {
+                    *out = len;
+                    *out.add(1) = esc;
+                }
+                return end;
+            }
+            Some(off) => {
+                let p = unsafe { i.add(off) };
+                if unsafe { *p } == b'"' {
+                    let len = (p as usize - s as usize) as u64;
+                    unsafe {
+                        *out = len;
+                        *out.add(1) = esc;
+                    }
+                    return unsafe { p.add(1) };
+                }
+                esc = 1;
+                i = unsafe { p.add(2) }; // skip '\' + escaped byte
+                if i > end {
+                    i = end;
+                }
+            }
+        }
+    }
 }
