@@ -8,7 +8,7 @@ hobbit. So:
 
 - **`bilbo`** — the ELF/DWARF/unwinding support layer: capture a frame,
   unwind it, find which local a pointer aliases, and classify its type
-  into a DWARF-free [`plan::Ty`]. Format-agnostic.
+  into a DWARF-free `plan::Ty`. Format-agnostic.
 - **`bilbo-json`** — a JSON deserializer built on `bilbo` that
   **JIT-compiles a specialized parser with cranelift** — and beats
   `serde_json` on the nativejson-benchmark trio. (Room for a
@@ -33,8 +33,8 @@ This is not a serious library. It is, however, faster than serde_json.
 
 ## Numbers
 
-`&str` → owned Rust value, Apple M-series, release, vs **default**
-`serde_json` (divan medians):
+`&str` → owned Rust value, release, vs **default** `serde_json` (divan
+medians on Apple M-series; also runs on x86_64 Linux, not yet timed there):
 
 | input | serde_json | bilbo-json | |
 |---|---|---|---|
@@ -56,17 +56,18 @@ fast. The cold phase is all `bilbo`; the hot phase is `bilbo-json`.
 
 **Cold — `bilbo` (once per type, cached):**
 
-1. `frame.rs` — capture registers and unwind exactly one frame with
+1. `platform` — capture registers and unwind exactly one frame with
    [`framehop`](https://crates.io/crates/framehop) (real CFI: macOS
-   compact-unwind / `.eh_frame`). This gives the caller's de-ASLR'd PC,
-   SP and FP — correct even under `-O3`, where a hand-rolled
-   frame-pointer walk breaks.
-2. `dwarf.rs` — load our own `.dSYM` once into a process-global
-   `Store`. Map that PC to its `DW_TAG_subprogram`, then evaluate every
-   local's DWARF location expression against the caller's frame to find
-   *which local the pointer aliases* (it's the `MaybeUninit<T>` one).
-   Recover its type DIE.
-3. `classify` turns the type DIE into a self-contained [`plan::Ty`]:
+   compact-unwind / `.eh_frame`; Linux `.eh_frame` / `.eh_frame_hdr`).
+   This gives the caller's de-ASLR'd PC, SP and FP — correct even under
+   `-O3`, where a hand-rolled frame-pointer walk breaks.
+2. `dwarf.rs` — load our own DWARF once into a process-global `Store`
+   (macOS: the `.dSYM`; Linux: the `.debug_*` embedded in
+   `current_exe()`). Map that PC to its `DW_TAG_subprogram`, then
+   evaluate every local's DWARF location expression against the caller's
+   frame to find *which local the pointer aliases* (it's the
+   `MaybeUninit<T>` one). Recover its type DIE.
+3. `classify` turns the type DIE into a self-contained `plan::Ty`:
    field offsets, primitive sizes, the real `ptr`/`cap`/`len` offsets
    inside `String`/`Vec` (Rust does not promise their order — we learn
    it from DWARF), niche *and* tagged `Option`, `()`, tuples, `Box<T>`,
@@ -133,10 +134,15 @@ exactly what the full-fidelity `twitter.json` benchmark exercises.
 
 ## Caveats
 
-- **macOS / AArch64 only.** Uses dyld, AArch64 inline asm, NEON, and
-  framehop's AArch64 unwinder.
-- Needs debug info: every profile sets `split-debuginfo = "packed"`
-  and `.cargo/config.toml` forces frame pointers.
+- **Two targets only: macOS/aarch64 and Linux/x86_64.** macOS uses
+  dyld, a Mach-O `.dSYM`, NEON, and framehop's aarch64 unwinder; Linux
+  uses `dl_iterate_phdr`, the ELF's embedded `.debug_*`, and framehop's
+  x86_64 unwinder. Each backend has its own arch inline asm. Nothing
+  else is supported.
+- Needs debug info, configured in `.cargo/config.toml` / `[profile.*]`:
+  macOS keeps a packed `.dSYM`; Linux forces `split-debuginfo=off` so
+  the full `.debug_*` stays embedded in the ELF. Both force frame
+  pointers.
 - Wildly `unsafe` by construction. `from_json(s, ptr)` writes a fully
   reconstructed value through a raw pointer based on what it *believes*
   the type is. This is a toy / proof of cursedness, not a crate to
@@ -151,8 +157,11 @@ exactly what the full-fidelity `twitter.json` benchmark exercises.
 
 | file | role |
 |---|---|
-| `frame.rs` | capture regs, framehop one-frame unwind, ASLR slide |
-| `dwarf.rs` | `.dSYM` store, PC→subprogram, local-by-pointer, classify |
+| `platform/mod.rs` | platform-agnostic surface; cfg-selects one backend |
+| `platform/darwin.rs` | aarch64 + Mach-O + dyld + `.dSYM` |
+| `platform/linux.rs` | x86_64 + ELF + `dl_iterate_phdr` + embedded `.debug_*` |
+| `frame.rs` | thin re-export of the active backend's regs/unwind |
+| `dwarf.rs` | DWARF store, PC→subprogram, local-by-pointer, classify |
 | `plan.rs` | `Ty` — the cached, DWARF-free layout artifact |
 | `resolve.rs` | two-level cache: callsite → type → `Resolved` (`Ty` + generic `ext`) |
 
