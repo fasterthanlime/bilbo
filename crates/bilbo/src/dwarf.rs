@@ -1103,3 +1103,45 @@ fn str_ref_offsets(dwarf: &Dwarf, unit: &Unit, off: Off) -> (usize, usize) {
     }
     (ptr_off, len_off)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sleb128;
+
+    /// Signed LEB128 is how rustc encodes the offset in `DW_OP_fbreg` /
+    /// `DW_OP_breg<n>`, so getting the sign extension right is load-bearing
+    /// for finding the aliased local on every platform. Vectors hand-checked
+    /// against the DWARF spec encoding.
+    #[test]
+    fn sleb128_known_vectors() {
+        // (bytes, value, bytes_consumed)
+        let cases: &[(&[u8], i64, usize)] = &[
+            (&[0x00], 0, 1),
+            (&[0x02], 2, 1),
+            (&[0x7f], -1, 1),
+            (&[0x7e], -2, 1),
+            // -24: a typical `DW_OP_fbreg` offset for a stack local.
+            (&[0x68], -24, 1),
+            (&[0x80, 0x01], 128, 2),
+            (&[0xff, 0x00], 127, 2),
+            (&[0x80, 0x7f], -128, 2),
+        ];
+        for &(bytes, want, want_used) in cases {
+            assert_eq!(
+                sleb128(bytes),
+                (want, want_used),
+                "sleb128({bytes:02x?})"
+            );
+        }
+    }
+
+    /// The decoder must report exactly how many bytes it consumed —
+    /// `eval_addr` relies on `rest.len() == used` to reject a trailing
+    /// `DW_OP_deref`.
+    #[test]
+    fn sleb128_reports_length_with_trailing_bytes() {
+        let (v, used) = sleb128(&[0x68, 0x9c, 0xde]);
+        assert_eq!((v, used), (-24, 1));
+    }
+}
+
