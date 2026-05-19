@@ -13,7 +13,12 @@ use std::time::Instant;
 
 const JITDUMP_MAGIC: u32 = 0x4A69_5444; // "JiTD", host-endian
 const JIT_CODE_LOAD: u32 = 0;
-const EM_AARCH64: u32 = 183;
+/// `e_machine` for the jitdump header — perf/stax use it to pick a
+/// disassembler, so it must match the host we JIT for.
+#[cfg(target_arch = "aarch64")]
+const E_MACHINE: u32 = 183; // EM_AARCH64
+#[cfg(target_arch = "x86_64")]
+const E_MACHINE: u32 = 62; // EM_X86_64
 
 struct State {
     file: File,
@@ -40,7 +45,7 @@ fn state() -> Option<&'static Mutex<State>> {
             h.extend_from_slice(&JITDUMP_MAGIC.to_ne_bytes());
             h.extend_from_slice(&1u32.to_ne_bytes()); // version
             h.extend_from_slice(&40u32.to_ne_bytes()); // header size
-            h.extend_from_slice(&EM_AARCH64.to_ne_bytes());
+            h.extend_from_slice(&E_MACHINE.to_ne_bytes());
             h.extend_from_slice(&0u32.to_ne_bytes()); // pad1
             h.extend_from_slice(&pid.to_ne_bytes());
             h.extend_from_slice(&0u64.to_ne_bytes()); // timestamp

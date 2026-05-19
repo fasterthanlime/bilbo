@@ -13,6 +13,7 @@ pub mod plan;
 
 mod dwarf;
 mod frame;
+mod platform;
 mod resolve;
 
 use std::sync::Arc;

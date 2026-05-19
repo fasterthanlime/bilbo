@@ -4,7 +4,6 @@
 //! by evaluating DWARF locations, and turning a type DIE into a [`Ty`].
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use gimli::{EndianSlice, RunTimeEndian};
@@ -12,6 +11,7 @@ use object::{Object, ObjectSection};
 use tracing::{info, warn};
 
 use crate::plan::{FieldTy, SeqLayout, Ty};
+use crate::platform::dwarf_regs;
 
 pub type Reader = EndianSlice<'static, RunTimeEndian>;
 pub type Dwarf = gimli::Dwarf<Reader>;
@@ -32,13 +32,12 @@ static STORE: OnceLock<Store> = OnceLock::new();
 /// process-lifetime cache, so there is nothing to free.
 pub fn store() -> &'static Store {
     STORE.get_or_init(|| {
-        let path = dsym_path();
-        info!("reading our own DWARF from {} (once)", path.display());
-        let file = std::fs::File::open(&path).expect("open dSYM");
-        let mmap =
-            unsafe { memmap2::Mmap::map(&file) }.expect("mmap dSYM");
-        let bytes: &'static [u8] = Box::leak(Box::new(mmap));
-        let object = object::File::parse(bytes).expect("parse Mach-O");
+        // The object that carries our DWARF is platform-specific (macOS:
+        // the Mach-O inside the `.dSYM`; Linux: the executable itself, with
+        // debuginfo embedded). The backend maps it and leaks it `'static`.
+        let bytes = crate::platform::dwarf_bytes();
+        let object =
+            object::File::parse(bytes).expect("parse debug object");
         let endian = if object.is_little_endian() {
             RunTimeEndian::Little
         } else {
@@ -76,23 +75,6 @@ pub fn store() -> &'static Store {
         info!("loaded {} compilation unit(s)", units.len());
         Store { dwarf, units }
     })
-}
-
-fn dsym_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let name = exe.file_name().expect("exe name").to_owned();
-    let dir = exe.parent().expect("exe dir");
-    let mut p = dir.to_path_buf();
-    p.push(format!("{}.dSYM", name.to_string_lossy()));
-    p.push("Contents/Resources/DWARF");
-    // The DWARF binary inside is named after the deps artifact (with a hash),
-    // not the final executable, so just take whatever is in there.
-    if let Ok(mut entries) = std::fs::read_dir(&p)
-        && let Some(Ok(e)) = entries.next()
-    {
-        return e.path();
-    }
-    exe // maybe debuginfo is embedded directly
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +199,11 @@ pub fn local_at_address(
     pc: u64,
     ptr: u64,
 ) -> Option<(String, Off)> {
-    // `DW_OP_fbreg` is relative to the subprogram's frame base. rustc on
-    // AArch64 emits `DW_AT_frame_base = DW_OP_reg29` (the frame pointer).
+    // `DW_OP_fbreg` is relative to the subprogram's frame base. rustc most
+    // often emits `DW_AT_frame_base = DW_OP_call_frame_cfa`; it can also be
+    // the bare frame-pointer register (`DW_OP_reg<fp>`) or that register
+    // plus an offset (`DW_OP_breg<fp>`). The frame-pointer register number
+    // is architecture-specific (see `platform::dwarf_regs`).
     let fb_expr = match unit.entry(sp).ok()?.attr_value(gimli::DW_AT_frame_base)
     {
         Some(gimli::AttributeValue::Exprloc(e)) => e.0.slice().to_vec(),
@@ -228,9 +213,14 @@ pub fn local_at_address(
         }
     };
     let frame_base = match fb_expr.first() {
-        Some(0x9c) => caller_sp,  // DW_OP_call_frame_cfa == caller SP at call
-        Some(0x6d) => caller_fp,  // DW_OP_reg29 (x29 / fp)
-        Some(0x8d) => caller_fp.wrapping_add(sleb128(&fb_expr[1..]).0 as u64),
+        // DW_OP_call_frame_cfa == caller SP at the call site.
+        Some(0x9c) => caller_sp,
+        // The frame-pointer register itself (`DW_OP_reg<fp>`).
+        Some(&dwarf_regs::OP_REG_FP) => caller_fp,
+        // Frame-pointer register + SLEB128 (`DW_OP_breg<fp>`).
+        Some(&dwarf_regs::OP_BREG_FP) => {
+            caller_fp.wrapping_add(sleb128(&fb_expr[1..]).0 as u64)
+        }
         _ => {
             warn!("unhandled frame_base expr {fb_expr:02x?}");
             return None;
@@ -275,11 +265,11 @@ pub fn local_at_address(
 }
 
 /// The register values a DWARF location expression may reference. We only
-/// know the few that matter for stack locals on AArch64.
+/// know the few that matter for stack locals.
 #[derive(Clone, Copy)]
 struct Regs {
-    fp: u64,         // x29
-    sp: u64,         // x31 / SP at the call site
+    fp: u64,         // frame pointer (x29 / rbp)
+    sp: u64,         // stack pointer at the call site (x31 / rsp)
     frame_base: u64, // resolved DW_AT_frame_base
 }
 
@@ -426,16 +416,17 @@ fn var_location(
 }
 
 /// Evaluate the address-producing subset of DWARF location expressions rustc
-/// emits for stack locals: `fbreg`, and `bregN` for the frame pointer (x29)
-/// or stack pointer (x31). A bare `regN` means the value lives in a register
-/// (no address); we can't help with that and return `None`.
+/// emits for stack locals: `fbreg`, and `breg<fp>` / `breg<sp>` for the
+/// frame and stack pointers (register numbers are architecture-specific —
+/// see `platform::dwarf_regs`). A bare `reg<n>` means the value lives in a
+/// register (no address); we can't help with that and return `None`.
 fn eval_addr(bytes: &[u8], r: Regs) -> Option<u64> {
     let op = *bytes.first()?;
     let (base, rest) = match op {
-        0x91 => (r.frame_base, &bytes[1..]),       // DW_OP_fbreg
-        0x9c => return Some(r.sp),                  // DW_OP_call_frame_cfa
-        0x8d => (r.fp, &bytes[1..]),                // DW_OP_breg29 (x29)
-        0x8f => (r.sp, &bytes[1..]),                // DW_OP_breg31 (SP)
+        0x91 => (r.frame_base, &bytes[1..]), // DW_OP_fbreg
+        0x9c => return Some(r.sp),           // DW_OP_call_frame_cfa
+        dwarf_regs::OP_BREG_FP => (r.fp, &bytes[1..]), // breg<fp>
+        dwarf_regs::OP_BREG_SP => (r.sp, &bytes[1..]), // breg<sp>
         _ => return None,
     };
     let (offset, used) = sleb128(rest);

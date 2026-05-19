@@ -1,4 +1,21 @@
 # We walk the frame-pointer chain by hand in `frame.rs`, so the frame pointer
 # must actually be there. Debug arm64 keeps it anyway; this makes it a promise.
+#
+# `[build]` is the macOS path: with the `Cargo.toml` profiles forcing
+# `split-debuginfo = "packed"`, the toolchain produces a `.dSYM` and the
+# Linux loader never enters this branch.
 [build]
 rustflags = ["-C", "force-frame-pointers=yes"]
+
+# Linux path. Cargo profiles can't be `cfg`'d, but per-target rustflags can.
+# These *replace* `[build]` rustflags (Cargo does not merge them), so the
+# frame-pointer promise has to be repeated here. `split-debuginfo=off`
+# overrides the profile's `packed`: on Linux `packed` would push the real
+# DIEs into a `.dwp` and leave only skeleton units in the ELF; `off` keeps
+# the full `.debug_*` embedded in the executable, which is exactly what the
+# Linux DWARF loader reads back out of `current_exe()`.
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "split-debuginfo=off",
+]
