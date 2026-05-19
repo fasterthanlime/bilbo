@@ -343,18 +343,16 @@ impl Hunt<'_> {
                         format!("{expr:02x?}"),
                         addr,
                     ));
-                    if addr == Some(self.ptr) {
-                        if let Some(ty) = ty {
-                            if is_mu {
-                                info!(
-                                    "local `{name}` : {tn} is at ptr; \
-                                     that's our target"
-                                );
-                                return Some((name, ty));
-                            }
-                            if self.fallback.is_none() {
-                                self.fallback = Some((name.clone(), ty));
-                            }
+                    if addr == Some(self.ptr) && let Some(ty) = ty {
+                        if is_mu {
+                            info!(
+                                "local `{name}` : {tn} is at ptr; \
+                                 that's our target"
+                            );
+                            return Some((name, ty));
+                        }
+                        if self.fallback.is_none() {
+                            self.fallback = Some((name.clone(), ty));
                         }
                     }
                 }
@@ -371,10 +369,8 @@ impl Hunt<'_> {
                     ));
                 }
             }
-            if is_mu {
-                if let Some(ty) = ty {
-                    self.mu.push((name.clone(), tn, ty));
-                }
+            if is_mu && let Some(ty) = ty {
+                self.mu.push((name.clone(), tn, ty));
             }
         }
         None
@@ -526,10 +522,8 @@ fn idx_close(
     ui: usize,
     map: &mut HashMap<String, (usize, usize)>,
 ) {
-    if f.has_child && !f.decl {
-        if let Some(n) = f.name {
-            map.entry(n).or_insert((ui, f.off));
-        }
+    if f.has_child && !f.decl && let Some(n) = f.name {
+        map.entry(n).or_insert((ui, f.off));
     }
 }
 
@@ -596,12 +590,10 @@ fn def_index() -> &'static HashMap<String, (usize, usize)> {
                 } else if matches!(
                     etag,
                     gimli::DW_TAG_member | gimli::DW_TAG_variant_part
-                ) {
-                    if let Some(top) = stack.last_mut() {
-                        if depth == top.depth + 1 {
-                            top.has_child = true;
-                        }
-                    }
+                ) && let Some(top) = stack.last_mut()
+                    && depth == top.depth + 1
+                {
+                    top.has_child = true;
                 }
             }
             while let Some(f) = stack.pop() {
@@ -658,12 +650,11 @@ fn is_stub(unit: &Unit, off: Off) -> bool {
 /// another CU). Returns the `(unit index, unit, off)` to use from here.
 fn def_site(unit: &Unit, off: Off) -> (usize, &'static Unit, Off) {
     let st = store();
-    if is_stub(unit, off) {
-        if let Some(name) = die_name(&st.dwarf, unit, off) {
-            if let Some(&(ui, o)) = def_index().get(&name) {
-                return (ui, &st.units[ui], gimli::UnitOffset(o));
-            }
-        }
+    if is_stub(unit, off)
+        && let Some(name) = die_name(&st.dwarf, unit, off)
+        && let Some(&(ui, o)) = def_index().get(&name)
+    {
+        return (ui, &st.units[ui], gimli::UnitOffset(o));
     }
     let ui = unit_idx(unit);
     (ui, &st.units[ui], off)
