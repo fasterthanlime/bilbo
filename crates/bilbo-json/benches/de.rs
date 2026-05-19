@@ -49,11 +49,11 @@ fn facet_json(bencher: Bencher) {
 /// `#[inline(never)]` so `from_json`'s one-frame unwind lands here.
 #[divan::bench]
 #[inline(never)]
-fn dwarf_json(bencher: Bencher) {
+fn bilbo_json(bencher: Bencher) {
     warmed(bencher, || -> Endpoint {
         let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
         unsafe {
-            dwarf_json::from_json(
+            bilbo_json::from_json(
                 black_box(JSON),
                 &mut e as *mut _ as *mut u8,
             );
@@ -68,10 +68,8 @@ fn dwarf_json(bencher: Bencher) {
 #[inline(never)]
 fn parser_pure(bencher: Bencher) {
     let mut warm: MaybeUninit<Endpoint> = MaybeUninit::uninit();
-    let r = unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
-    let pf = *r
-        .jit_parser
-        .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
+    let r = unsafe { bilbo_json::resolve(&mut warm as *mut _ as *mut u8) };
+    let pf = *r.ext(bilbo_json::jit::compile_parser);
     warmed(bencher, || -> Endpoint {
         let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
         unsafe {
@@ -84,7 +82,7 @@ fn parser_pure(bencher: Bencher) {
 /// Just our naive parser (no bind), for the breakdown.
 #[divan::bench]
 fn parse_only(bencher: Bencher) {
-    warmed(bencher, || dwarf_json::json::parse(black_box(JSON)));
+    warmed(bencher, || bilbo_json::json::parse(black_box(JSON)));
 }
 
 /// Just the interpreter bind step, type + JSON pre-resolved.
@@ -92,12 +90,12 @@ fn parse_only(bencher: Bencher) {
 #[inline(never)]
 fn bind_only_interp(bencher: Bencher) {
     let mut warm: MaybeUninit<Endpoint> = MaybeUninit::uninit();
-    let r = unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
-    let parsed = dwarf_json::json::parse(JSON);
+    let r = unsafe { bilbo_json::resolve(&mut warm as *mut _ as *mut u8) };
+    let parsed = bilbo_json::json::parse(JSON);
     warmed(bencher, || -> Endpoint {
         let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
         unsafe {
-            dwarf_json::interp::run(
+            bilbo_json::interp::run(
                 &mut e as *mut _ as *mut u8,
                 &r.ty,
                 &parsed,

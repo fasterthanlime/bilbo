@@ -103,8 +103,9 @@ pub enum Ty {
         size: u64,
         inner: Box<Ty>,
     },
-    /// `BTreeMap<String, V>`. Built by calling the real std map via the
-    /// [`crate::tramp`] trampolines, resolved from DWARF.
+    /// `BTreeMap<String, V>`. Built by calling the real std map via
+    /// `bilbo-json`'s `tramp` trampolines, resolved from DWARF (their
+    /// link-time addresses end up here as `new_at` / `insert`).
     Map {
         key: Box<Ty>,
         key_size: u64,

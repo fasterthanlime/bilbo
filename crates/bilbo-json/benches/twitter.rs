@@ -196,14 +196,14 @@ struct UrlList {
 const J: &str = include_str!("../tests/data/twitter.json");
 
 fn main() {
-    dwarf_json::debug_init();
+    bilbo_json::debug_init();
 
     // Correctness gate: our parser must produce exactly what serde does,
     // including the recursive `retweeted_status` and every absent-Option.
     let want: Twitter = serde_json::from_str(J).unwrap();
     let mut got: MaybeUninit<Twitter> = MaybeUninit::uninit();
     let got = unsafe {
-        dwarf_json::from_json_jit_parse(J, &mut got as *mut _ as *mut u8);
+        bilbo_json::from_json_jit_parse(J, &mut got as *mut _ as *mut u8);
         got.assume_init()
     };
     assert!(
@@ -250,7 +250,7 @@ fn serde_json(bencher: Bencher) {
 fn ergonomic(j: &str) {
     let mut e: MaybeUninit<Twitter> = MaybeUninit::uninit();
     let v = unsafe {
-        dwarf_json::from_json_jit_parse(j, &mut e as *mut _ as *mut u8);
+        bilbo_json::from_json_jit_parse(j, &mut e as *mut _ as *mut u8);
         e.assume_init()
     };
     black_box(&v);
@@ -261,7 +261,7 @@ fn ergonomic(j: &str) {
 /// (L1 hit: callsite -> type -> JIT'd parser), then runs that parser.
 #[divan::bench]
 #[inline(never)]
-fn dwarf_json(bencher: Bencher) {
+fn bilbo_json(bencher: Bencher) {
     warmed(bencher, || ergonomic(black_box(J)));
 }
 
@@ -269,10 +269,8 @@ fn dwarf_json(bencher: Bencher) {
 #[inline(never)]
 fn parser_pure(bencher: Bencher) {
     let mut warm: MaybeUninit<Twitter> = MaybeUninit::uninit();
-    let r = unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
-    let pf = *r
-        .jit_parser
-        .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
+    let r = unsafe { bilbo_json::resolve(&mut warm as *mut _ as *mut u8) };
+    let pf = *r.ext(bilbo_json::jit::compile_parser);
     warmed(bencher, || -> Twitter {
         let mut e: MaybeUninit<Twitter> = MaybeUninit::uninit();
         unsafe {

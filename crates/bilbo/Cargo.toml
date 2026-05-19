@@ -1,0 +1,19 @@
+[package]
+name = "bilbo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Recover a value's destination type at runtime from the program's own DWARF, guided by the stack frame. Who hangs out with elves and dwarves all day? Bilbo."
+
+[lib]
+name = "bilbo"
+path = "src/lib.rs"
+
+[dependencies]
+gimli.workspace = true
+memmap2.workspace = true
+object.workspace = true
+tracing.workspace = true
+framehop.workspace = true

@@ -38,12 +38,12 @@ struct Geometry {
 const J: &str = include_str!("../tests/data/canada.json");
 
 fn main() {
-    dwarf_json::debug_init();
+    bilbo_json::debug_init();
 
     let want: Canada = serde_json::from_str(J).unwrap();
     let mut got: MaybeUninit<Canada> = MaybeUninit::uninit();
     let got = unsafe {
-        dwarf_json::from_json_jit_parse(J, &mut got as *mut _ as *mut u8);
+        bilbo_json::from_json_jit_parse(J, &mut got as *mut _ as *mut u8);
         got.assume_init()
     };
     // Correctness gate. We can't use `got == want`: serde_json's
@@ -115,7 +115,7 @@ fn serde_json(bencher: Bencher) {
 fn ergonomic(j: &str) {
     let mut e: MaybeUninit<Canada> = MaybeUninit::uninit();
     let v = unsafe {
-        dwarf_json::from_json_jit_parse(j, &mut e as *mut _ as *mut u8);
+        bilbo_json::from_json_jit_parse(j, &mut e as *mut _ as *mut u8);
         e.assume_init()
     };
     black_box(&v);
@@ -126,7 +126,7 @@ fn ergonomic(j: &str) {
 /// (L1 hit: callsite -> type -> JIT'd parser), then runs that parser.
 #[divan::bench]
 #[inline(never)]
-fn dwarf_json(bencher: Bencher) {
+fn bilbo_json(bencher: Bencher) {
     warmed(bencher, || ergonomic(black_box(J)));
 }
 
@@ -134,10 +134,8 @@ fn dwarf_json(bencher: Bencher) {
 #[inline(never)]
 fn parser_pure(bencher: Bencher) {
     let mut warm: MaybeUninit<Canada> = MaybeUninit::uninit();
-    let r = unsafe { dwarf_json::resolve(&mut warm as *mut _ as *mut u8) };
-    let pf = *r
-        .jit_parser
-        .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
+    let r = unsafe { bilbo_json::resolve(&mut warm as *mut _ as *mut u8) };
+    let pf = *r.ext(bilbo_json::jit::compile_parser);
     warmed(bencher, || -> Canada {
         let mut e: MaybeUninit<Canada> = MaybeUninit::uninit();
         unsafe {

@@ -7,8 +7,9 @@
 
 use std::alloc::{Layout, alloc};
 
+use bilbo::plan::{SeqLayout, Ty};
+
 use crate::json::Json;
-use crate::plan::{SeqLayout, Ty};
 
 /// # Safety
 /// `dst` must point to uninitialized memory laid out exactly as `ty`

@@ -1,0 +1,50 @@
+[package]
+name = "bilbo-json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A JSON deserializer that recovers the destination type at runtime from the program's own DWARF (via bilbo), then JIT-compiles a specialized parser."
+
+[lib]
+name = "bilbo_json"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bilbo-json"
+path = "src/main.rs"
+
+[dependencies]
+bilbo.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+memchr.workspace = true
+fast-float2.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+divan.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "de"
+harness = false
+
+[[bench]]
+name = "citm"
+harness = false
+
+[[bench]]
+name = "canada"
+harness = false
+
+[[bench]]
+name = "twitter"
+harness = false

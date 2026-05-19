@@ -11,22 +11,44 @@
 //! sites that both fill an `Endpoint` resolve to the very same type DIE, so
 //! they share one classify and one cranelift compile.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::info;
 
-use crate::jit::Parser;
 use crate::plan::Ty;
 use crate::{dwarf, frame};
 
 type TypeKey = (usize, usize); // (unit index, DIE offset)
 
-/// Everything the hot path needs for a given type, built once.
+/// Everything a consumer needs for a given type, built once: the
+/// DWARF-free [`Ty`], plus a generic per-type slot a downstream crate can
+/// fill with its own compiled artifact (see [`Resolved::ext`]).
 pub struct Resolved {
     pub ty: Ty,
-    /// The cranelift raw-bytes parser, compiled lazily on first use.
-    pub jit_parser: OnceLock<Parser>,
+    /// A downstream artifact (e.g. `bilbo-json`'s JIT parser), produced
+    /// lazily on first use and shared by every call site of this type.
+    ext: OnceLock<Box<dyn Any + Send + Sync>>,
+}
+
+impl Resolved {
+    /// Get-or-init this type's downstream artifact, cached for the lifetime
+    /// of the process — once per *type*, shared across every call site that
+    /// resolves to it (so the JIT compiles a given `Ty` exactly once).
+    ///
+    /// `init` is handed the resolved [`Ty`]. The first caller's `T` wins;
+    /// calling again with a different `T` panics (one consumer per type).
+    pub fn ext<T, F>(&self, init: F) -> &T
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(&Ty) -> T,
+    {
+        self.ext
+            .get_or_init(|| Box::new(init(&self.ty)))
+            .downcast_ref::<T>()
+            .expect("Resolved::ext called with two different T for one type")
+    }
 }
 
 static L1: OnceLock<Mutex<HashMap<u64, TypeKey>>> = OnceLock::new();
@@ -76,7 +98,7 @@ pub fn resolved(raw: &frame::Raw, ptr: u64) -> Arc<Resolved> {
                 info!("classified type {tk:?} (`{name}`) -> {ty:?}");
                 Arc::new(Resolved {
                     ty,
-                    jit_parser: OnceLock::new(),
+                    ext: OnceLock::new(),
                 })
             })
             .clone()

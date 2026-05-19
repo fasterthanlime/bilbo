@@ -797,7 +797,7 @@ fn structure(dwarf: &Dwarf, unit: &Unit, off: Off, name: &str) -> Ty {
             .unwrap_or_else(|| {
                 panic!(
                     "no map_insert trampoline for V=`{v_name}` \
-                     (call dwarf_json::tramp::force::<{v_name}>())"
+                     (call bilbo_json::tramp::force::<{v_name}>())"
                 )
             });
         return Ty::Map {
@@ -891,7 +891,7 @@ fn attr_udata(unit: &Unit, off: Off, at: gimli::DwAt) -> Option<u64> {
     e.attr(at)?.udata_value()
 }
 
-/// Find `crate::tramp::{fn_prefix}::<V>`'s runtime address: scan every
+/// Find `bilbo_json::tramp::{fn_prefix}::<V>`'s runtime address: scan every
 /// unit for a subprogram whose name starts with `fn_prefix` and whose `V`
 /// template parameter resolves to a type named `v_name`. DWARF gives the
 /// link-time `DW_AT_low_pc`; add the ASLR slide to get something callable.

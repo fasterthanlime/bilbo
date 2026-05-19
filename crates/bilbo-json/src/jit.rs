@@ -18,7 +18,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 
-use crate::plan::{RecCell, SeqLayout, Ty};
+use bilbo::plan::{RecCell, SeqLayout, Ty};
 
 /// `extern "C" fn(dst: *mut u8, input: *const u8, len: usize)` — parses raw
 /// JSON bytes straight into the struct, no `Json` tree at all.
@@ -232,7 +232,7 @@ impl Jit {
         if size > 0 {
             let bytes = unsafe { std::slice::from_raw_parts(code, size) };
             crate::jitdump::register(
-                &format!("dwarf_json::jit::{name}"),
+                &format!("bilbo_json::jit::{name}"),
                 code as u64,
                 bytes,
             );
@@ -244,7 +244,7 @@ impl Jit {
             let c = self.module.get_finalized_function(id);
             let bytes = unsafe { std::slice::from_raw_parts(c, sz) };
             crate::jitdump::register(
-                &format!("dwarf_json::jit::{nm}"),
+                &format!("bilbo_json::jit::{nm}"),
                 c as u64,
                 bytes,
             );
@@ -902,7 +902,7 @@ impl Emit<'_, '_> {
     /// its constant offset, comma-separated, `]`.
     fn parse_tuple(
         &mut self,
-        fields: &[crate::plan::FieldTy],
+        fields: &[bilbo::plan::FieldTy],
         dst: Value,
         cur: Value,
         p: &Pctx,
@@ -925,7 +925,7 @@ impl Emit<'_, '_> {
 
     fn parse_struct(
         &mut self,
-        fields: &[crate::plan::FieldTy],
+        fields: &[bilbo::plan::FieldTy],
         dst: Value,
         cur: Value,
         p: &Pctx,

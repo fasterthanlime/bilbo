@@ -1,16 +1,25 @@
-# dwarf-json
+# bilbo
 
-A JSON deserializer that figures out the destination type **at runtime by
-reading the program's own DWARF debug info**, then **JIT-compiles a
-specialized parser with cranelift** — and beats `serde_json` on the
-nativejson-benchmark trio.
+A Cargo workspace for recovering a value's type **at runtime by reading
+the program's own DWARF debug info**, guided by the stack frame.
+
+Who hangs out with elves and dwarves all day? That's right — Bilbo the
+hobbit. So:
+
+- **`bilbo`** — the ELF/DWARF/unwinding support layer: capture a frame,
+  unwind it, find which local a pointer aliases, and classify its type
+  into a DWARF-free [`plan::Ty`]. Format-agnostic.
+- **`bilbo-json`** — a JSON deserializer built on `bilbo` that
+  **JIT-compiles a specialized parser with cranelift** — and beats
+  `serde_json` on the nativejson-benchmark trio. (Room for a
+  `bilbo-postcard` etc. later — they'd share `bilbo`'s cold path.)
 
 It started as a stupid idea:
 
 ```rust
 let mut e: MaybeUninit<Endpoint> = MaybeUninit::uninit();
-from_json(r#"{ "host": "rustweek.org", "port": 443 }"#,
-          &mut e as *mut _ as *mut u8);
+bilbo_json::from_json(r#"{ "host": "rustweek.org", "port": 443 }"#,
+                      &mut e as *mut _ as *mut u8);
 let e = unsafe { e.assume_init() };
 ```
 
@@ -27,7 +36,7 @@ This is not a serious library. It is, however, faster than serde_json.
 `&str` → owned Rust value, Apple M-series, release, vs **default**
 `serde_json` (divan medians):
 
-| input | serde_json | dwarf-json | |
+| input | serde_json | bilbo-json | |
 |---|---|---|---|
 | `citm_catalog.json` (1.7 MB) | ~1.06 ms | **~845 µs** | ~1.25× |
 | `canada.json` (2.3 MB) | ~2.23 ms | **~1.34 ms** | ~1.7× |
@@ -43,9 +52,9 @@ coords within serde's own error."
 ## How it works
 
 Two phases. The cursed part happens once; the hot path is boring and
-fast.
+fast. The cold phase is all `bilbo`; the hot phase is `bilbo-json`.
 
-**Cold (once per type, cached):**
+**Cold — `bilbo` (once per type, cached):**
 
 1. `frame.rs` — capture registers and unwind exactly one frame with
    [`framehop`](https://crates.io/crates/framehop) (real CFI: macOS
@@ -63,12 +72,14 @@ fast.
    it from DWARF), niche *and* tagged `Option`, `()`, tuples, `Box<T>`,
    `BTreeMap`, and recursive types (a cycle in the DIE graph becomes a
    back-edge in `Ty`, tied off with `Arc<OnceLock<Ty>>`).
-4. `resolve.rs` — a two-level cache: call-site PC → type → resolved
-   plan + JIT'd function. The deserializer is a property of the *type*,
-   not the call site, so two sites filling the same type share one
-   compile.
+4. `resolve.rs` — a two-level cache: call-site PC → type → `Resolved`
+   (the `Ty` plus a generic per-type `ext` slot). The deserializer is a
+   property of the *type*, not the call site, so two sites filling the
+   same type share one classify — and one compile, because the consumer
+   stashes its compiled artifact in `Resolved::ext`, keyed by that same
+   per-type cache.
 
-**Hot (every call, no DWARF, no file I/O):**
+**Hot — `bilbo-json` (every call, no DWARF, no file I/O):**
 
 - `jit.rs` — cranelift compiles a function specialized to the `Ty`:
   field-name bytes and offsets baked in as constants, a `memchr`/
@@ -79,7 +90,8 @@ fast.
   via a `br_table`, then a tiny per-length chain — the difference
   between losing and winning on twitter. Recursive types compile one
   function per cycle and call into it. Or `interp.rs`, a plain
-  interpreter over the same `Ty`, kept as a baseline.
+  interpreter over the same `Ty`, kept as a baseline. The compiled
+  parser lands in `bilbo::Resolved::ext` (one compile per type).
 - `jitdump.rs` — emits `/tmp/jit-<pid>.dump` (perf jitdump) so
   profilers (e.g. [stax](https://github.com/bearcove/stax)) can name
   and disassemble the JIT'd code instead of showing `<unresolved>`.
@@ -87,18 +99,22 @@ fast.
 The one honest caveat: a `BTreeMap` has no DWARF-discoverable layout we
 can poke our way into (B-tree nodes, unstable). So for maps we call the
 *real* `std::collections::BTreeMap` through thin `#[inline(never)]`
-trampolines (`tramp.rs`), monomorphized once per value type, whose
-addresses we resolve — from DWARF, like everything else.
+trampolines (`bilbo-json`'s `tramp.rs`), monomorphized once per value
+type, whose addresses `bilbo` resolves — from DWARF, like everything
+else.
 
 ## Running it
 
 ```sh
-cargo run                 # demo: Endpoint + tagged-Option + Box + recursive, narrated
-cargo bench --bench de    # small struct vs serde_json / facet-json
-cargo bench --bench citm  # citm_catalog.json
-cargo bench --bench canada
-cargo bench --bench twitter  # full fidelity: enums, Box, recursion
+cargo run -p bilbo-json                 # demo: Endpoint + tagged-Option + Box + recursive, narrated
+cargo bench -p bilbo-json --bench de    # small struct vs serde_json / facet-json
+cargo bench -p bilbo-json --bench citm  # citm_catalog.json
+cargo bench -p bilbo-json --bench canada
+cargo bench -p bilbo-json --bench twitter  # full fidelity: enums, Box, recursion
 ```
+
+`BILBO_JSON_PROFILE=1 cargo run -p bilbo-json --release` prints the
+JIT'd parser's address and hammers it forever, for `stax` to sample.
 
 Each bench gates against `serde_json` before timing: byte-for-byte for
 `citm`/`twitter`/`de`, and structure-exact + correctly-rounded floats
@@ -131,12 +147,19 @@ exactly what the full-fidelity `twitter.json` benchmark exercises.
 
 ## Module map
 
+`crates/bilbo` — the ELF/DWARF support layer:
+
 | file | role |
 |---|---|
 | `frame.rs` | capture regs, framehop one-frame unwind, ASLR slide |
 | `dwarf.rs` | `.dSYM` store, PC→subprogram, local-by-pointer, classify |
 | `plan.rs` | `Ty` — the cached, DWARF-free layout artifact |
-| `resolve.rs` | two-level cache: callsite → type → resolved |
+| `resolve.rs` | two-level cache: callsite → type → `Resolved` (`Ty` + generic `ext`) |
+
+`crates/bilbo-json` — the JSON consumer:
+
+| file | role |
+|---|---|
 | `jit.rs` | cranelift backend (specialized parser) + runtime shims |
 | `interp.rs` | plain interpreter backend (baseline) |
 | `json.rs` | tiny lenient JSON parser (interp/baseline only) |

@@ -20,7 +20,7 @@ fn main() {
     let mut e: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
     // Safety: `e` is exactly the local `ptr` will be matched to.
     unsafe {
-        dwarf_json::from_json(
+        bilbo_json::from_json(
             r#"
             {
               "host": "rustweek.org",
@@ -42,7 +42,7 @@ fn main() {
     let mut k: std::mem::MaybeUninit<Endpoint> = std::mem::MaybeUninit::uninit();
     // Safety: `k` is exactly the local `ptr` will be matched to.
     unsafe {
-        dwarf_json::from_json_jit_parse(
+        bilbo_json::from_json_jit_parse(
             r#"{ "host": "parse.jit", "port": 9001, "tags": ["raw","bytes","🥖"], }"#,
             &mut k as *mut _ as *mut u8,
         );
@@ -64,7 +64,7 @@ fn main() {
     }
     let mut o: std::mem::MaybeUninit<Opt> = std::mem::MaybeUninit::uninit();
     unsafe {
-        dwarf_json::from_json_jit_parse(
+        bilbo_json::from_json_jit_parse(
             r#"{"a":42,"b":-7,"c":true,"n":null,"s":null}"#,
             &mut o as *mut _ as *mut u8,
         );
@@ -107,7 +107,7 @@ fn main() {
     let mut bi: std::mem::MaybeUninit<BoxDemo> =
         std::mem::MaybeUninit::uninit();
     unsafe {
-        dwarf_json::from_json(BJ, &mut bi as *mut _ as *mut u8);
+        bilbo_json::from_json(BJ, &mut bi as *mut _ as *mut u8);
     }
     let bi = unsafe { bi.assume_init() };
     assert_eq!(bi, want(), "Box<T> round-trip (interp)");
@@ -116,7 +116,7 @@ fn main() {
     let mut bj: std::mem::MaybeUninit<BoxDemo> =
         std::mem::MaybeUninit::uninit();
     unsafe {
-        dwarf_json::from_json_jit_parse(BJ, &mut bj as *mut _ as *mut u8);
+        bilbo_json::from_json_jit_parse(BJ, &mut bj as *mut _ as *mut u8);
     }
     let bj = unsafe { bj.assume_init() };
     assert_eq!(bj, want(), "Box<T> round-trip (jit)");
@@ -142,7 +142,7 @@ fn main() {
     let mut ni: std::mem::MaybeUninit<Node> =
         std::mem::MaybeUninit::uninit();
     unsafe {
-        dwarf_json::from_json(NJ, &mut ni as *mut _ as *mut u8);
+        bilbo_json::from_json(NJ, &mut ni as *mut _ as *mut u8);
     }
     let ni = unsafe { ni.assume_init() };
     assert_eq!(ni, chain(), "recursive type round-trip (interp)");
@@ -151,7 +151,7 @@ fn main() {
     let mut nj: std::mem::MaybeUninit<Node> =
         std::mem::MaybeUninit::uninit();
     unsafe {
-        dwarf_json::from_json_jit_parse(NJ, &mut nj as *mut _ as *mut u8);
+        bilbo_json::from_json_jit_parse(NJ, &mut nj as *mut _ as *mut u8);
     }
     let nj = unsafe { nj.assume_init() };
     assert_eq!(nj, chain(), "recursive type round-trip (jit)");
@@ -159,18 +159,16 @@ fn main() {
 
     // Profiling mode: print the JIT'd parser's code address and hammer it
     // forever so `stax` can sample + disassemble it.
-    //   DWARF_JSON_PROFILE=1 cargo run --release
-    if std::env::var_os("DWARF_JSON_PROFILE").is_some() {
+    //   BILBO_JSON_PROFILE=1 cargo run --release
+    if std::env::var_os("BILBO_JSON_PROFILE").is_some() {
         const J: &str =
             r#"{"host":"rustweek.org","port":443,"tags":["conf","rust","crab"]}"#;
         let mut warm: std::mem::MaybeUninit<Endpoint> =
             std::mem::MaybeUninit::uninit();
         let r = unsafe {
-            dwarf_json::resolve(&mut warm as *mut _ as *mut u8)
+            bilbo_json::resolve(&mut warm as *mut _ as *mut u8)
         };
-        let f = *r
-            .jit_parser
-            .get_or_init(|| dwarf_json::jit::compile_parser(&r.ty));
+        let f = *r.ext(bilbo_json::jit::compile_parser);
         info!("PARSER @ {:#x}  (stax annotate that address)", f as usize);
         loop {
             let mut e: std::mem::MaybeUninit<Endpoint> =

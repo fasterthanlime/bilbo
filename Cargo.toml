@@ -1,34 +1,16 @@
-[package]
-name = "dwarf_json"
+[workspace]
+members = ["crates/bilbo", "crates/bilbo-json"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Amos Wenger <hi@bearcove.eu>"]
-description = "A JSON deserializer that recovers the destination type at runtime from the program's own DWARF, then JIT-compiles a specialized parser."
-repository = "https://github.com/fasterthanlime/dwarf-json"
+repository = "https://github.com/fasterthanlime/bilbo"
 
-[lib]
-name = "dwarf_json"
-path = "src/lib.rs"
-
-[[bin]]
-name = "dwarf_json"
-path = "src/main.rs"
-
-# We read our own DWARF at runtime, so every profile needs a .dSYM and a
-# real frame pointer (the latter also comes from .cargo/config.toml).
-[profile.dev]
-split-debuginfo = "packed"
-
-[profile.release]
-debug = true
-split-debuginfo = "packed"
-
-[profile.bench]
-debug = true
-split-debuginfo = "packed"
-
-[dependencies]
+[workspace.dependencies]
+bilbo = { path = "crates/bilbo" }
 gimli = "0.33.0"
 memmap2 = "0.9.10"
 object = "0.39.1"
@@ -41,26 +23,22 @@ cranelift-frontend = "0.131.1"
 framehop = "0.16.0"
 memchr = "2.8.0"
 fast-float2 = "0.2.3"
-
-[dev-dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 facet = "0.46.2"
 facet-json = "0.46.1"
 divan = "0.1.21"
 serde_json = "1.0.149"
 
-[[bench]]
-name = "de"
-harness = false
+# We read our own DWARF at runtime, so every profile needs a .dSYM and a
+# real frame pointer (the latter also comes from .cargo/config.toml).
+# Profiles only take effect from the workspace root.
+[profile.dev]
+split-debuginfo = "packed"
 
-[[bench]]
-name = "citm"
-harness = false
+[profile.release]
+debug = true
+split-debuginfo = "packed"
 
-[[bench]]
-name = "canada"
-harness = false
-
-[[bench]]
-name = "twitter"
-harness = false
+[profile.bench]
+debug = true
+split-debuginfo = "packed"
